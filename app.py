@@ -7,7 +7,7 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
-from openai import OpenAI
+from openai import AsyncOpenAI  # <-- Используем асинхронный клиент
 import httpx
 import aiohttp
 import random
@@ -31,11 +31,17 @@ client = None
 
 if DEEPSEEK_API_KEY:
     try:
-        http_client = httpx.Client(timeout=30.0, follow_redirects=True)
-        client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com/v1", http_client=http_client)
-        test = client.chat.completions.create(model="deepseek-chat", messages=[{"role": "user", "content": "Привет"}], max_tokens=5)
+        # Используем асинхронный HTTP клиент
+        http_client = httpx.AsyncClient(timeout=30.0, follow_redirects=True)
+        client = AsyncOpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com/v1", http_client=http_client)
+        # Тестовый запрос
+        asyncio.run(client.chat.completions.create(
+            model="deepseek-chat", 
+            messages=[{"role": "user", "content": "Привет"}], 
+            max_tokens=5
+        ))
         deepseek_available = True
-        logger.info(f"DeepSeek подключен: {test.choices[0].message.content}")
+        logger.info("DeepSeek подключен")
     except Exception as e:
         logger.warning(f"DeepSeek недоступен: {e}")
         client = None
@@ -47,8 +53,18 @@ DB_PATH = "vacancies.db"
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("""CREATE TABLE IF NOT EXISTS sent_vacancies (id TEXT PRIMARY KEY, title TEXT, company TEXT, sent_at TIMESTAMP)""")
-    c.execute("""CREATE TABLE IF NOT EXISTS search_log (id INTEGER PRIMARY KEY AUTOINCREMENT, found_count INTEGER, sent_count INTEGER, searched_at TIMESTAMP)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS sent_vacancies (
+        id TEXT PRIMARY KEY, 
+        title TEXT, 
+        company TEXT, 
+        sent_at TIMESTAMP
+    )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS search_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, 
+        found_count INTEGER, 
+        sent_count INTEGER, 
+        searched_at TIMESTAMP
+    )""")
     conn.commit()
     conn.close()
 
@@ -63,14 +79,16 @@ def is_vacancy_sent(vacancy_id):
 def mark_vacancy_sent(vacancy_id, title, company):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("INSERT OR IGNORE INTO sent_vacancies VALUES (?, ?, ?, ?)", (vacancy_id, title, company, datetime.now()))
+    c.execute("INSERT OR IGNORE INTO sent_vacancies VALUES (?, ?, ?, ?)", 
+              (vacancy_id, title, company, datetime.now()))
     conn.commit()
     conn.close()
 
 def log_search(found, sent):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("INSERT INTO search_log (found_count, sent_count, searched_at) VALUES (?, ?, ?)", (found, sent, datetime.now()))
+    c.execute("INSERT INTO search_log (found_count, sent_count, searched_at) VALUES (?, ?, ?)", 
+              (found, sent, datetime.now()))
     conn.commit()
     conn.close()
 
@@ -98,10 +116,17 @@ def cleanup_old_vacancies(days=30):
 
 USER_FILTERS = {
     "salary_min": 200000,
-    "cities": {"Волгоград": "24", "Москва": "1", "Казань": "88", "Нижний Новгород": "66", "Уфа": "99", "Астана": "160", "Баку": "100", "Минск": "1002"},
-    "keywords": ["коммерческий директор", "руководитель отдела продаж", "директор по продажам", "директор филиала", "руководитель направления"],
-    "industry_keywords": ["нефтепродукты", "ГСМ", "топливо", "бензин", "дизель", "мазут", "нефть", "нефтетрейдинг", "нефтебаза", "АЗС", "СПбМТСБ", "НПЗ", "нефтепереработка", "моторное топливо", "нефтяной", "oil", "petroleum", "fuel"],
-    "exclude_words": ["стажёр", "intern", "junior", "1С", "QA", "тестировщик", "розница", "продавец-консультант", "FMCG", "продукты питания", "одежда", "обувь", "строительные материалы", "электроника", "IT", "финансы", "банки", "страхование", "недвижимость", "маркетинг", "реклама", "HR", "медицина", "образование"]
+    "cities": {"Волгоград": "24", "Москва": "1", "Казань": "88", "Нижний Новгород": "66", 
+               "Уфа": "99", "Астана": "160", "Баку": "100", "Минск": "1002"},
+    "keywords": ["коммерческий директор", "руководитель отдела продаж", "директор по продажам", 
+                 "директор филиала", "руководитель направления"],
+    "industry_keywords": ["нефтепродукты", "ГСМ", "топливо", "бензин", "дизель", "мазут", 
+                         "нефть", "нефтетрейдинг", "нефтебаза", "АЗС", "СПбМТСБ", "НПЗ", 
+                         "нефтепереработка", "моторное топливо", "нефтяной", "oil", "petroleum", "fuel"],
+    "exclude_words": ["стажёр", "intern", "junior", "1С", "QA", "тестировщик", "розница", 
+                      "продавец-консультант", "FMCG", "продукты питания", "одежда", "обувь", 
+                      "строительные материалы", "электроника", "IT", "финансы", "банки", 
+                      "страхование", "недвижимость", "маркетинг", "реклама", "HR", "медицина", "образование"]
 }
 
 CANDIDATE_PROFILE = """
@@ -310,7 +335,8 @@ def parse_rss(xml_text):
     return vacancies
 
 def is_relevant_by_keywords(vacancy):
-    text = (vacancy.get("name", "") + " " + vacancy.get("description", "") + " " + vacancy.get("snippet", {}).get("requirement", "")).lower()
+    text = (vacancy.get("name", "") + " " + vacancy.get("description", "") + 
+            " " + vacancy.get("snippet", {}).get("requirement", "")).lower()
     if not any(kw.lower() in text for kw in USER_FILTERS["industry_keywords"]):
         return False
     if any(ew.lower() in text for ew in USER_FILTERS["exclude_words"]):
@@ -321,11 +347,15 @@ async def ask_deepseek(vacancy):
     global deepseek_available, client
     if not deepseek_available and DEEPSEEK_API_KEY:
         try:
-            http_client = httpx.Client(timeout=30.0, follow_redirects=True)
-            client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com/v1", http_client=http_client)
-            test = client.chat.completions.create(model="deepseek-chat", messages=[{"role": "user", "content": "Привет"}], max_tokens=5)
+            http_client = httpx.AsyncClient(timeout=30.0, follow_redirects=True)
+            client = AsyncOpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com/v1", http_client=http_client)
+            test = await client.chat.completions.create(
+                model="deepseek-chat", 
+                messages=[{"role": "user", "content": "Привет"}], 
+                max_tokens=5
+            )
             deepseek_available = True
-            logger.info(f"DeepSeek восстановлен: {test.choices[0].message.content}")
+            logger.info("DeepSeek восстановлен")
         except Exception as e:
             logger.debug(f"DeepSeek всё ещё недоступен: {e}")
             client = None
@@ -358,7 +388,12 @@ async def ask_deepseek(vacancy):
 Ответь строго "ДА" или "НЕТ". Если сомневаешься, но кандидат может быть полезен — ответь "ДА"."""
 
     try:
-        response = client.chat.completions.create(model="deepseek-chat", messages=[{"role": "user", "content": prompt}], temperature=0.1, max_tokens=10)
+        response = await client.chat.completions.create(
+            model="deepseek-chat", 
+            messages=[{"role": "user", "content": prompt}], 
+            temperature=0.1, 
+            max_tokens=10
+        )
         answer = response.choices[0].message.content.strip().upper()
         return answer.startswith("ДА")
     except Exception as e:
@@ -463,9 +498,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global deepseek_available
     if not deepseek_available and DEEPSEEK_API_KEY:
         try:
-            http_client = httpx.Client(timeout=30.0, follow_redirects=True)
-            test_client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com/v1", http_client=http_client)
-            test = test_client.chat.completions.create(model="deepseek-chat", messages=[{"role": "user", "content": "Привет"}], max_tokens=5)
+            http_client = httpx.AsyncClient(timeout=30.0, follow_redirects=True)
+            test_client = AsyncOpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com/v1", http_client=http_client)
+            test = await test_client.chat.completions.create(
+                model="deepseek-chat", 
+                messages=[{"role": "user", "content": "Привет"}], 
+                max_tokens=5
+            )
             deepseek_available = True
         except:
             pass
@@ -582,7 +621,7 @@ async def health():
 async def webhook(request: Request):
     data = await request.json()
     update = Update.de_json(data, application.bot)
-    await application.process_update(update)
+    await application.process_update(update)  # <-- await добавлен
     return {"ok": True}
 
 application = None
@@ -592,7 +631,7 @@ async def keep_alive_ping():
         await asyncio.sleep(300)
         logger.info("💓 Keep-alive ping")
 
-def run_webhook():
+async def run_webhook():
     global application
     init_db()
 
@@ -608,16 +647,22 @@ def run_webhook():
     application.add_handler(CommandHandler("help", help_cmd))
     application.add_error_handler(error_handler)
 
-    application.initialize()
+    # ВСЕ await добавлены
+    await application.initialize()
+    await application.start()
 
     if RENDER_EXTERNAL_URL:
         webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
-        application.bot.set_webhook(url=webhook_url)
+        await application.bot.set_webhook(url=webhook_url)  # <-- await
         logger.info(f"🔗 Webhook установлен: {webhook_url}")
 
-    application.start()
+    # Запускаем keep-alive как фоновую задачу
+    asyncio.create_task(keep_alive_ping())
 
-    uvicorn.run(app, host="0.0.0.0", port=10000)
+    # Запускаем uvicorn
+    config = uvicorn.Config(app, host="0.0.0.0", port=10000, log_level="info")
+    server = uvicorn.Server(config)
+    await server.serve()
 
 if __name__ == "__main__":
-    run_webhook()
+    asyncio.run(run_webhook())
