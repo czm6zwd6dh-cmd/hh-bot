@@ -28,23 +28,23 @@ if not TELEGRAM_TOKEN:
 
 deepseek_available = False
 client = None
+search_lock = asyncio.Lock()
 
-if DEEPSEEK_API_KEY:
+# ========== DEEPSEEK INIT (lazy, не блокируем старт) ==========
+def init_deepseek_client():
+    global deepseek_available, client
+    if not DEEPSEEK_API_KEY:
+        logger.warning("DEEPSEEK_API_KEY не задан")
+        return
     try:
-        http_client = httpx.AsyncClient(timeout=30.0, follow_redirects=True)
+        http_client = httpx.AsyncClient(timeout=10.0, follow_redirects=True)
         client = AsyncOpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com/v1", http_client=http_client)
-        asyncio.run(client.chat.completions.create(
-            model="deepseek-chat", 
-            messages=[{"role": "user", "content": "Привет"}], 
-            max_tokens=5
-        ))
-        deepseek_available = True
-        logger.info("DeepSeek подключен")
+        logger.info("DeepSeek клиент создан (проверка будет при первом запросе)")
     except Exception as e:
-        logger.warning(f"DeepSeek недоступен: {e}")
+        logger.warning(f"DeepSeek init error: {e}")
         client = None
-else:
-    logger.warning("DEEPSEEK_API_KEY не задан")
+
+init_deepseek_client()
 
 DB_PATH = "vacancies.db"
 
@@ -227,15 +227,15 @@ async def fetch_rss(session, city_id, keyword, per_page=20, retries=3):
     for attempt in range(retries):
         await hh_rate_limiter.wait()
         try:
-            timeout = aiohttp.ClientTimeout(total=45)
+            timeout = aiohttp.ClientTimeout(total=30, connect=10)
             async with session.get(url, headers=headers, timeout=timeout) as resp:
                 return await _handle_rss_response(resp, city_id, keyword)
         except asyncio.TimeoutError:
             logger.warning(f"Таймаут RSS {city_id}/{keyword}, попытка {attempt+1}/{retries}")
-            await asyncio.sleep(2 ** attempt + random.uniform(1, 3))
+            await asyncio.sleep(min(2 ** attempt + random.uniform(1, 3), 10))
         except Exception as e:
             logger.error(f"Ошибка RSS {city_id}/{keyword}: {e}, попытка {attempt+1}/{retries}")
-            await asyncio.sleep(2 ** attempt + random.uniform(1, 3))
+            await asyncio.sleep(min(2 ** attempt + random.uniform(1, 3), 10))
     return []
 
 async def _handle_rss_response(resp, city_id, keyword):
@@ -263,7 +263,8 @@ async def fetch_html_fallback(session, city_id, keyword="коммерчески�
     }
     await hh_rate_limiter.wait()
     try:
-        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+        timeout = aiohttp.ClientTimeout(total=30, connect=10)
+        async with session.get(url, headers=headers, timeout=timeout) as resp:
             if resp.status == 200:
                 html = await resp.text()
                 hh_rate_limiter.on_success()
@@ -292,7 +293,7 @@ def parse_html_vacancies(html, city_id):
         vacancy["area"] = {"name": city_match.group(1).strip() if city_match else city_id}
         salary_match = re.search(r'data-qa="vacancy-serp__vacancy-compensation"[^>]*>([^<]+)</span>', html)
         vacancy["salary"] = parse_salary(salary_match.group(1)) if salary_match else None
-        desc_match = re.search(r'data-qa="vacancy-serp__vacancy_snippet_requirement"[^>]*>([^<]+)</span>', html)
+        desc_match = re.search(r'data-qa="vacancy-serp__vacancy-snippet_requirement"[^>]*>([^<]+)</span>', html)
         desc = desc_match.group(1) if desc_match else ""
         vacancy["description"] = desc
         vacancy["snippet"] = {"requirement": desc[:300] + "..." if len(desc) > 300 else desc, "responsibility": ""}
@@ -354,22 +355,35 @@ def is_relevant_by_keywords(vacancy):
         return False
     return True
 
-async def ask_deepseek(vacancy):
+async def _check_deepseek_connection():
+    """Проверка DeepSeek с жёстким таймаутом"""
     global deepseek_available, client
-    if not deepseek_available and DEEPSEEK_API_KEY:
-        try:
-            http_client = httpx.AsyncClient(timeout=30.0, follow_redirects=True)
-            client = AsyncOpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com/v1", http_client=http_client)
-            test = await client.chat.completions.create(
+    if not DEEPSEEK_API_KEY or not client:
+        return False
+    try:
+        response = await asyncio.wait_for(
+            client.chat.completions.create(
                 model="deepseek-chat", 
                 messages=[{"role": "user", "content": "Привет"}], 
                 max_tokens=5
-            )
-            deepseek_available = True
-            logger.info("DeepSeek восстановлен")
-        except Exception as e:
-            logger.debug(f"DeepSeek всё ещё недоступен: {e}")
-            client = None
+            ),
+            timeout=10.0
+        )
+        deepseek_available = True
+        logger.info("DeepSeek подключен и работает")
+        return True
+    except Exception as e:
+        logger.warning(f"DeepSeek недоступен: {e}")
+        deepseek_available = False
+        return False
+
+async def ask_deepseek(vacancy):
+    global deepseek_available, client
+    
+    # Ленивая проверка при первом вызове
+    if not deepseek_available and DEEPSEEK_API_KEY:
+        await _check_deepseek_connection()
+    
     if not deepseek_available or not client:
         logger.info("DeepSeek отключен, пропускаю AI-фильтрацию")
         return True
@@ -399,14 +413,21 @@ async def ask_deepseek(vacancy):
 Ответь строго "ДА" или "НЕТ". Если сомневаешься, но кандидат может быть полезен — ответь "ДА"."""
 
     try:
-        response = await client.chat.completions.create(
-            model="deepseek-chat", 
-            messages=[{"role": "user", "content": prompt}], 
-            temperature=0.1, 
-            max_tokens=10
+        response = await asyncio.wait_for(
+            client.chat.completions.create(
+                model="deepseek-chat", 
+                messages=[{"role": "user", "content": prompt}], 
+                temperature=0.1, 
+                max_tokens=10
+            ),
+            timeout=15.0
         )
         answer = response.choices[0].message.content.strip().upper()
         return answer.startswith("ДА")
+    except asyncio.TimeoutError:
+        logger.error("DeepSeek: таймаут ответа (15 сек)")
+        deepseek_available = False
+        return True  # Пропускаем фильтрацию при таймауте
     except Exception as e:
         logger.error(f"DeepSeek error: {e}")
         deepseek_available = False
@@ -444,87 +465,103 @@ def format_vacancy_message(vacancy):
 В сопроводительном письме подчеркните опыт работы с СПбМТСБ и управления нефтебазой.
 ━━━━━━━━━━━━━━━━━━━━"""
 
+MAX_SEARCH_TIME = 300  # 5 минут максимум на весь поиск
+
 async def background_search(context: ContextTypes.DEFAULT_TYPE):
-    global deepseek_available
-    logger.info("🔄 Запуск фонового поиска...")
-    chat_id = None
-    if context.job and hasattr(context.job, 'chat_id') and context.job.chat_id:
-        chat_id = context.job.chat_id
-    elif CHAT_ID:
-        chat_id = int(CHAT_ID)
-    if not chat_id:
-        logger.error("Нет chat_id для отправки")
-        return
-
-    all_vacancies = []
-    async with aiohttp.ClientSession() as session:
-        for city_ru, city_id in USER_FILTERS["cities"].items():
-            city_vacancies = []
-            for keyword in USER_FILTERS["keywords"]:
-                logger.info(f"Поиск: {keyword} в {city_ru}")
-                result = await fetch_rss(session, city_id, keyword, per_page=20)
-                if result:
-                    city_vacancies.extend(result)
-                else:
-                    fallback = await fetch_html_fallback(session, city_id, keyword)
-                    city_vacancies.extend(fallback)
-                await asyncio.sleep(2 + random.uniform(0, 2))
-            all_vacancies.extend(city_vacancies)
-            logger.info(f"Город {city_ru}: {len(city_vacancies)} вакансий")
-            await asyncio.sleep(3 + random.uniform(1, 3))
-
-    seen = set()
-    unique = [v for v in all_vacancies if not (v['id'] in seen or seen.add(v['id']))]
+    global search_lock
     
-    # Async check sent vacancies
-    new_vacancies = []
-    for v in unique:
-        if not await is_vacancy_sent(v['id']):
-            new_vacancies.append(v)
-    
-    logger.info(f"Найдено {len(unique)} уникальных, новых: {len(new_vacancies)}")
-
-    if not new_vacancies:
-        await context.bot.send_message(chat_id=chat_id, text="🔍 Новых вакансий не найдено.")
-        await log_search(0, 0)
+    # Предотвращаем параллельный запуск
+    if search_lock.locked():
+        logger.warning("Поиск уже выполняется, пропускаю")
         return
+    
+    async with search_lock:
+        start_time = asyncio.get_event_loop().time()
+        logger.info("🔄 Запуск фонового поиска...")
+        
+        chat_id = None
+        if context.job and hasattr(context.job, 'chat_id') and context.job.chat_id:
+            chat_id = context.job.chat_id
+        elif CHAT_ID:
+            chat_id = int(CHAT_ID)
+        if not chat_id:
+            logger.error("Нет chat_id для отправки")
+            return
 
-    keyword_filtered = [v for v in new_vacancies if is_relevant_by_keywords(v)]
-    logger.info(f"После keyword-фильтра: {len(keyword_filtered)}")
+        try:
+            all_vacancies = []
+            async with aiohttp.ClientSession() as session:
+                for city_ru, city_id in USER_FILTERS["cities"].items():
+                    # Проверяем общий таймаут
+                    if asyncio.get_event_loop().time() - start_time > MAX_SEARCH_TIME:
+                        logger.warning("Достигнут лимит времени поиска, прерываю")
+                        break
+                    
+                    city_vacancies = []
+                    for keyword in USER_FILTERS["keywords"]:
+                        logger.info(f"Поиск: {keyword} в {city_ru}")
+                        result = await fetch_rss(session, city_id, keyword, per_page=20)
+                        if result:
+                            city_vacancies.extend(result)
+                        else:
+                            fallback = await fetch_html_fallback(session, city_id, keyword)
+                            city_vacancies.extend(fallback)
+                        await asyncio.sleep(2 + random.uniform(0, 2))
+                    all_vacancies.extend(city_vacancies)
+                    logger.info(f"Город {city_ru}: {len(city_vacancies)} вакансий")
+                    await asyncio.sleep(3 + random.uniform(1, 3))
 
-    matched = []
-    for v in keyword_filtered:
-        if await ask_deepseek(v):
-            matched.append(v)
-            await mark_vacancy_sent(v['id'], v.get('name', ''), v.get('employer', {}).get('name', ''))
-        await asyncio.sleep(0.5)
+            seen = set()
+            unique = [v for v in all_vacancies if not (v['id'] in seen or seen.add(v['id']))]
+            
+            # Async check sent vacancies
+            new_vacancies = []
+            for v in unique:
+                if not await is_vacancy_sent(v['id']):
+                    new_vacancies.append(v)
+            
+            logger.info(f"Найдено {len(unique)} уникальных, новых: {len(new_vacancies)}")
 
-    logger.info(f"После фильтрации: {len(matched)}")
-    await log_search(len(unique), len(matched))
-    ds_status = "✅ с AI-фильтром" if deepseek_available else "⚠️ без AI"
+            if not new_vacancies:
+                await context.bot.send_message(chat_id=chat_id, text="🔍 Новых вакансий не найдено.")
+                await log_search(0, 0)
+                return
 
-    if matched:
-        await context.bot.send_message(chat_id=chat_id, text=f"🔍 Найдено {len(matched)} вакансий {ds_status}:")
-        for v in matched:
-            await context.bot.send_message(chat_id=chat_id, text=format_vacancy_message(v))
-            await asyncio.sleep(2)
-    else:
-        await context.bot.send_message(chat_id=chat_id, text=f"🔍 Подходящих вакансий не найдено {ds_status}")
+            keyword_filtered = [v for v in new_vacancies if is_relevant_by_keywords(v)]
+            logger.info(f"После keyword-фильтра: {len(keyword_filtered)}")
+
+            matched = []
+            for v in keyword_filtered:
+                # Проверяем общий таймаут
+                if asyncio.get_event_loop().time() - start_time > MAX_SEARCH_TIME:
+                    logger.warning("Достигнут лимит времени при AI-фильтрации, прерываю")
+                    break
+                
+                if await ask_deepseek(v):
+                    matched.append(v)
+                    await mark_vacancy_sent(v['id'], v.get('name', ''), v.get('employer', {}).get('name', ''))
+                await asyncio.sleep(0.5)
+
+            logger.info(f"После фильтрации: {len(matched)}")
+            await log_search(len(unique), len(matched))
+            ds_status = "✅ с AI-фильтром" if deepseek_available else "⚠️ без AI"
+
+            if matched:
+                await context.bot.send_message(chat_id=chat_id, text=f"🔍 Найдено {len(matched)} вакансий {ds_status}:")
+                for v in matched:
+                    await context.bot.send_message(chat_id=chat_id, text=format_vacancy_message(v))
+                    await asyncio.sleep(2)
+            else:
+                await context.bot.send_message(chat_id=chat_id, text=f"🔍 Подходящих вакансий не найдено {ds_status}")
+                
+        except Exception as e:
+            logger.error(f"Ошибка в background_search: {e}", exc_info=True)
+            try:
+                await context.bot.send_message(chat_id=chat_id, text=f"⚠️ Ошибка поиска: {str(e)[:300]}")
+            except:
+                pass
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global deepseek_available
-    if not deepseek_available and DEEPSEEK_API_KEY:
-        try:
-            http_client = httpx.AsyncClient(timeout=30.0, follow_redirects=True)
-            test_client = AsyncOpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com/v1", http_client=http_client)
-            test = await test_client.chat.completions.create(
-                model="deepseek-chat", 
-                messages=[{"role": "user", "content": "Привет"}], 
-                max_tokens=5
-            )
-            deepseek_available = True
-        except:
-            pass
     ds_status = "✅ подключен" if deepseek_available else "❌ отключен"
     scraper_status = "✅ ScraperAPI" if SCRAPERAPI_KEY else "❌ прокси"
     await update.message.reply_text(
@@ -551,22 +588,43 @@ async def search_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def schedule_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
+    
+    # Всегда сначала удаляем ВСЕ старые job'ы авто-поиска
+    existing_jobs = context.job_queue.get_jobs_by_name("auto_search")
+    for job in existing_jobs:
+        job.schedule_removal()
+        logger.info(f"Удалён старый job авто-поиска: {job}")
+    
     if not context.args:
-        jobs = context.job_queue.get_jobs_by_name("auto_search")
-        if jobs:
+        if existing_jobs:
             await update.message.reply_text("⏰ Авто-поиск активен (9:00 и 18:00 UTC)\nОтключить: /schedule off")
         else:
             await update.message.reply_text("❌ Авто-поиск отключен\nВключить: /schedule on")
         return
+    
     command = context.args[0].lower()
-    for job in context.job_queue.get_jobs_by_name("auto_search"):
-        job.schedule_removal()
+    
     if command == "off":
         await update.message.reply_text("❌ Авто-поиск отключён")
         return
+    
     if command in ["on", "twice"]:
-        context.job_queue.run_daily(background_search, time=datetime.strptime("09:00", "%H:%M").time(), chat_id=chat_id, name="auto_search")
-        context.job_queue.run_daily(background_search, time=datetime.strptime("18:00", "%H:%M").time(), chat_id=chat_id, name="auto_search")
+        # Добавляем job'ы заново
+        from telegram.ext import JobQueue
+        from datetime import time as dt_time
+        
+        context.job_queue.run_daily(
+            background_search, 
+            time=dt_time(hour=9, minute=0), 
+            chat_id=chat_id, 
+            name="auto_search"
+        )
+        context.job_queue.run_daily(
+            background_search, 
+            time=dt_time(hour=18, minute=0), 
+            chat_id=chat_id, 
+            name="auto_search"
+        )
         await update.message.reply_text("✅ Авто-поиск включён!\n• 9:00 UTC\n• 18:00 UTC\nОтключить: /schedule off")
 
 async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -643,11 +701,6 @@ async def webhook(request: Request):
 
 application = None
 
-async def keep_alive_ping():
-    while True:
-        await asyncio.sleep(300)
-        logger.info("💓 Keep-alive ping")
-
 async def run_webhook():
     global application
     await init_db()
@@ -671,8 +724,6 @@ async def run_webhook():
         webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
         await application.bot.set_webhook(url=webhook_url)
         logger.info(f"🔗 Webhook установлен: {webhook_url}")
-
-    asyncio.create_task(keep_alive_ping())
 
     config = uvicorn.Config(app, host="0.0.0.0", port=10000, log_level="info")
     server = uvicorn.Server(config)
