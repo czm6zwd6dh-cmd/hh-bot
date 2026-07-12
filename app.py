@@ -12,16 +12,11 @@ import httpx
 import aiohttp
 import random
 from fastapi import FastAPI, Request
-from uvicorn import Config, Server
+import uvicorn
 
-# ---------- НАСТРОЙКА ЛОГИРОВАНИЯ ----------
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
-)
+logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ---------- ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ ----------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -31,26 +26,14 @@ RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL")
 if not TELEGRAM_TOKEN:
     raise ValueError("TELEGRAM_TOKEN не задан")
 
-if not SCRAPERAPI_KEY:
-    logger.warning("SCRAPERAPI_KEY не задан — будут прямые запросы к HH.ru (риск бана)")
-
-# ---------- ПРОВЕРКА DEEPSEEK (с фиксом proxies) ----------
 deepseek_available = False
 client = None
 
 if DEEPSEEK_API_KEY:
     try:
         http_client = httpx.Client(timeout=30.0, follow_redirects=True)
-        client = OpenAI(
-            api_key=DEEPSEEK_API_KEY,
-            base_url="https://api.deepseek.com/v1",
-            http_client=http_client
-        )
-        test = client.chat.completions.create(
-            model="deepseek-chat",
-            messages=[{"role": "user", "content": "Привет"}],
-            max_tokens=5
-        )
+        client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com/v1", http_client=http_client)
+        test = client.chat.completions.create(model="deepseek-chat", messages=[{"role": "user", "content": "Привет"}], max_tokens=5)
         deepseek_available = True
         logger.info(f"DeepSeek подключен: {test.choices[0].message.content}")
     except Exception as e:
@@ -59,16 +42,13 @@ if DEEPSEEK_API_KEY:
 else:
     logger.warning("DEEPSEEK_API_KEY не задан")
 
-# ---------- БАЗА ДАННЫХ ----------
 DB_PATH = "vacancies.db"
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("""CREATE TABLE IF NOT EXISTS sent_vacancies
-                 (id TEXT PRIMARY KEY, title TEXT, company TEXT, sent_at TIMESTAMP)""")
-    c.execute("""CREATE TABLE IF NOT EXISTS search_log
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT, found_count INTEGER, sent_count INTEGER, searched_at TIMESTAMP)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS sent_vacancies (id TEXT PRIMARY KEY, title TEXT, company TEXT, sent_at TIMESTAMP)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS search_log (id INTEGER PRIMARY KEY AUTOINCREMENT, found_count INTEGER, sent_count INTEGER, searched_at TIMESTAMP)""")
     conn.commit()
     conn.close()
 
@@ -83,16 +63,14 @@ def is_vacancy_sent(vacancy_id):
 def mark_vacancy_sent(vacancy_id, title, company):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("INSERT OR IGNORE INTO sent_vacancies VALUES (?, ?, ?, ?)",
-              (vacancy_id, title, company, datetime.now()))
+    c.execute("INSERT OR IGNORE INTO sent_vacancies VALUES (?, ?, ?, ?)", (vacancy_id, title, company, datetime.now()))
     conn.commit()
     conn.close()
 
 def log_search(found, sent):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("INSERT INTO search_log (found_count, sent_count, searched_at) VALUES (?, ?, ?)",
-              (found, sent, datetime.now()))
+    c.execute("INSERT INTO search_log (found_count, sent_count, searched_at) VALUES (?, ?, ?)", (found, sent, datetime.now()))
     conn.commit()
     conn.close()
 
@@ -118,26 +96,10 @@ def cleanup_old_vacancies(days=30):
     conn.close()
     return deleted
 
-# ---------- НАСТРОЙКИ ----------
 USER_FILTERS = {
     "salary_min": 200000,
-    "cities": {
-        "Волгоград": "24",
-        "Москва": "1",
-        "Казань": "88",
-        "Нижний Новгород": "66",
-        "Уфа": "99",
-        "Астана": "160",
-        "Баку": "100",
-        "Минск": "1002"
-    },
-    "keywords": [
-        "коммерческий директор",
-        "руководитель отдела продаж",
-        "директор по продажам",
-        "директор филиала",
-        "руководитель направления"
-    ],
+    "cities": {"Волгоград": "24", "Москва": "1", "Казань": "88", "Нижний Новгород": "66", "Уфа": "99", "Астана": "160", "Баку": "100", "Минск": "1002"},
+    "keywords": ["коммерческий директор", "руководитель отдела продаж", "директор по продажам", "директор филиала", "руководитель направления"],
     "industry_keywords": ["нефтепродукты", "ГСМ", "топливо", "бензин", "дизель", "мазут", "нефть", "нефтетрейдинг", "нефтебаза", "АЗС", "СПбМТСБ", "НПЗ", "нефтепереработка", "моторное топливо", "нефтяной", "oil", "petroleum", "fuel"],
     "exclude_words": ["стажёр", "intern", "junior", "1С", "QA", "тестировщик", "розница", "продавец-консультант", "FMCG", "продукты питания", "одежда", "обувь", "строительные материалы", "электроника", "IT", "финансы", "банки", "страхование", "недвижимость", "маркетинг", "реклама", "HR", "медицина", "образование"]
 }
@@ -166,7 +128,6 @@ CANDIDATE_PROFILE = """
 • Вооружённые силы: командир взвода, ж/д перевозки
 """
 
-# ---------- USER-AGENTS РОТАЦИЯ ----------
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -175,7 +136,6 @@ USER_AGENTS = [
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 ]
 
-# ---------- SCRAPERAPI ----------
 def build_scraperapi_url(target_url, use_render=False):
     if not SCRAPERAPI_KEY:
         return target_url
@@ -183,7 +143,6 @@ def build_scraperapi_url(target_url, use_render=False):
         return f"http://api.scraperapi.com?api_key={SCRAPERAPI_KEY}&url={target_url}&render=true&premium=true"
     return f"http://api.scraperapi.com?api_key={SCRAPERAPI_KEY}&url={target_url}&premium=true"
 
-# ---------- RATE LIMITER ----------
 class RateLimiter:
     def __init__(self, min_delay=2.0, max_delay=5.0):
         self.min_delay = min_delay
@@ -220,18 +179,15 @@ class RateLimiter:
 
 hh_rate_limiter = RateLimiter(min_delay=2.0, max_delay=5.0)
 
-# ---------- RSS ПАРСИНГ ----------
 async def fetch_rss(session, city_id, keyword, per_page=20, retries=3):
     encoded_kw = keyword.replace(" ", "+")
     target_url = f"https://hh.ru/search/vacancy/rss?text={encoded_kw}&area={city_id}&items_on_page={per_page}"
     url = build_scraperapi_url(target_url, use_render=False)
-
     headers = {
         "User-Agent": random.choice(USER_AGENTS),
         "Accept": "application/rss+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
     }
-
     for attempt in range(retries):
         await hh_rate_limiter.wait()
         try:
@@ -264,13 +220,11 @@ async def fetch_html_fallback(session, city_id, keyword="коммерчески�
     encoded_kw = keyword.replace(" ", "+")
     target_url = f"https://hh.ru/search/vacancy?text={encoded_kw}&area={city_id}&items_on_page=20"
     url = build_scraperapi_url(target_url, use_render=False)
-
     headers = {
         "User-Agent": random.choice(USER_AGENTS),
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
         "Accept-Language": "ru-RU,ru;q=0.9",
     }
-
     await hh_rate_limiter.wait()
     try:
         async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=30)) as resp:
@@ -355,18 +309,14 @@ def parse_rss(xml_text):
         logger.error(f"Ошибка обработки RSS: {e}")
     return vacancies
 
-# ---------- ФИЛЬТРАЦИЯ ----------
 def is_relevant_by_keywords(vacancy):
-    text = (vacancy.get("name", "") + " " + 
-            vacancy.get("description", "") + " " + 
-            vacancy.get("snippet", {}).get("requirement", "")).lower()
+    text = (vacancy.get("name", "") + " " + vacancy.get("description", "") + " " + vacancy.get("snippet", {}).get("requirement", "")).lower()
     if not any(kw.lower() in text for kw in USER_FILTERS["industry_keywords"]):
         return False
     if any(ew.lower() in text for ew in USER_FILTERS["exclude_words"]):
         return False
     return True
 
-# ---------- DEEPSEEK ----------
 async def ask_deepseek(vacancy):
     global deepseek_available, client
     if not deepseek_available and DEEPSEEK_API_KEY:
@@ -448,7 +398,6 @@ def format_vacancy_message(vacancy):
 В сопроводительном письме подчеркните опыт работы с СПбМТСБ и управления нефтебазой.
 ━━━━━━━━━━━━━━━━━━━━"""
 
-# ---------- ФОНОВЫЙ ПОИСК ----------
 async def background_search(context: ContextTypes.DEFAULT_TYPE):
     global deepseek_available
     logger.info("🔄 Запуск фонового поиска...")
@@ -510,7 +459,6 @@ async def background_search(context: ContextTypes.DEFAULT_TYPE):
     else:
         await context.bot.send_message(chat_id=chat_id, text=f"🔍 Подходящих вакансий не найдено {ds_status}")
 
-# ---------- КОМАНДЫ ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global deepseek_available
     if not deepseek_available and DEEPSEEK_API_KEY:
@@ -619,7 +567,7 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update and update.effective_message:
         await update.effective_message.reply_text("⚠️ Ошибка. Попробуйте позже.")
 
-# ========== WEB SERVER + WEBHOOK (НЕ СПИТ!) ==========
+# ========== WEB SERVER + WEBHOOK ==========
 app = FastAPI()
 
 @app.get("/")
@@ -632,17 +580,14 @@ async def health():
 
 @app.post("/webhook")
 async def webhook(request: Request):
-    """Получает обновления от Telegram webhook"""
     data = await request.json()
     update = Update.de_json(data, application.bot)
     await application.process_update(update)
     return {"ok": True}
 
-# Глобальная переменная для application
 application = None
 
 async def keep_alive_ping():
-    """Авто-пинг каждые 5 минут, чтобы Render не усыплял"""
     while True:
         await asyncio.sleep(300)
         logger.info("💓 Keep-alive ping")
@@ -650,7 +595,7 @@ async def keep_alive_ping():
 def run_webhook():
     global application
     init_db()
-    
+
     application = Application.builder().token(TELEGRAM_TOKEN).build()
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("search", search_now))
@@ -663,25 +608,16 @@ def run_webhook():
     application.add_handler(CommandHandler("help", help_cmd))
     application.add_error_handler(error_handler)
 
-    # Инициализируем бота
     application.initialize()
-    
-    # Устанавливаем webhook
+
     if RENDER_EXTERNAL_URL:
         webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
         application.bot.set_webhook(url=webhook_url)
         logger.info(f"🔗 Webhook установлен: {webhook_url}")
-    
-    # Запускаем keep-alive
-    asyncio.create_task(keep_alive_ping())
-    
-    # Запускаем job_queue для авто-поиска
+
     application.start()
-    
-    # Запускаем FastAPI сервер
-    config = Config(app=app, host="0.0.0.0", port=10000, loop="asyncio")
-    server = Server(config)
-    server.run()
+
+    uvicorn.run(app, host="0.0.0.0", port=10000)
 
 if __name__ == "__main__":
     run_webhook()
