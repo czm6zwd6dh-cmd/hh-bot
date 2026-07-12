@@ -10,7 +10,6 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 from openai import AsyncOpenAI
 import httpx
 import aiohttp
-import aiosqlite  # <-- асинхронная SQLite
 import random
 from fastapi import FastAPI, Request
 import uvicorn
@@ -49,57 +48,82 @@ else:
 
 DB_PATH = "vacancies.db"
 
+def _init_db_sync():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""CREATE TABLE IF NOT EXISTS sent_vacancies (
+        id TEXT PRIMARY KEY, title TEXT, company TEXT, sent_at TIMESTAMP
+    )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS search_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, found_count INTEGER, sent_count INTEGER, searched_at TIMESTAMP
+    )""")
+    conn.commit()
+    conn.close()
+
+def _is_vacancy_sent_sync(vacancy_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT 1 FROM sent_vacancies WHERE id = ?", (vacancy_id,))
+    result = c.fetchone() is not None
+    conn.close()
+    return result
+
+def _mark_vacancy_sent_sync(vacancy_id, title, company):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("INSERT OR IGNORE INTO sent_vacancies VALUES (?, ?, ?, ?)", 
+              (vacancy_id, title, company, datetime.now()))
+    conn.commit()
+    conn.close()
+
+def _log_search_sync(found, sent):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("INSERT INTO search_log (found_count, sent_count, searched_at) VALUES (?, ?, ?)", 
+              (found, sent, datetime.now()))
+    conn.commit()
+    conn.close()
+
+def _get_stats_sync():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM sent_vacancies")
+    total_sent = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM search_log")
+    total_searches = c.fetchone()[0]
+    c.execute("SELECT found_count, sent_count, searched_at FROM search_log ORDER BY searched_at DESC LIMIT 5")
+    recent = c.fetchall()
+    conn.close()
+    return total_sent, total_searches, recent
+
+def _cleanup_sync(days=30):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    cutoff = datetime.now() - timedelta(days=days)
+    c.execute("DELETE FROM sent_vacancies WHERE sent_at < ?", (cutoff,))
+    deleted = c.rowcount
+    conn.commit()
+    conn.close()
+    return deleted
+
+# Async wrappers
 async def init_db():
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""CREATE TABLE IF NOT EXISTS sent_vacancies (
-            id TEXT PRIMARY KEY, 
-            title TEXT, 
-            company TEXT, 
-            sent_at TIMESTAMP
-        )""")
-        await db.execute("""CREATE TABLE IF NOT EXISTS search_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, 
-            found_count INTEGER, 
-            sent_count INTEGER, 
-            searched_at TIMESTAMP
-        )""")
-        await db.commit()
+    await asyncio.to_thread(_init_db_sync)
 
 async def is_vacancy_sent(vacancy_id):
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT 1 FROM sent_vacancies WHERE id = ?", (vacancy_id,)) as cursor:
-            row = await cursor.fetchone()
-            return row is not None
+    return await asyncio.to_thread(_is_vacancy_sent_sync, vacancy_id)
 
 async def mark_vacancy_sent(vacancy_id, title, company):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("INSERT OR IGNORE INTO sent_vacancies VALUES (?, ?, ?, ?)", 
-                        (vacancy_id, title, company, datetime.now()))
-        await db.commit()
+    await asyncio.to_thread(_mark_vacancy_sent_sync, vacancy_id, title, company)
 
 async def log_search(found, sent):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("INSERT INTO search_log (found_count, sent_count, searched_at) VALUES (?, ?, ?)", 
-                        (found, sent, datetime.now()))
-        await db.commit()
+    await asyncio.to_thread(_log_search_sync, found, sent)
 
 async def get_stats():
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT COUNT(*) FROM sent_vacancies") as cursor:
-            total_sent = (await cursor.fetchone())[0]
-        async with db.execute("SELECT COUNT(*) FROM search_log") as cursor:
-            total_searches = (await cursor.fetchone())[0]
-        async with db.execute("SELECT found_count, sent_count, searched_at FROM search_log ORDER BY searched_at DESC LIMIT 5") as cursor:
-            recent = await cursor.fetchall()
-        return total_sent, total_searches, recent
+    return await asyncio.to_thread(_get_stats_sync)
 
 async def cleanup_old_vacancies(days=30):
-    async with aiosqlite.connect(DB_PATH) as db:
-        cutoff = datetime.now() - timedelta(days=days)
-        await db.execute("DELETE FROM sent_vacancies WHERE sent_at < ?", (cutoff,))
-        deleted = db.total_changes
-        await db.commit()
-        return deleted
+    return await asyncio.to_thread(_cleanup_sync, days)
 
 USER_FILTERS = {
     "salary_min": 200000,
@@ -452,7 +476,7 @@ async def background_search(context: ContextTypes.DEFAULT_TYPE):
     seen = set()
     unique = [v for v in all_vacancies if not (v['id'] in seen or seen.add(v['id']))]
     
-    # Асинхронная проверка отправленных
+    # Async check sent vacancies
     new_vacancies = []
     for v in unique:
         if not await is_vacancy_sent(v['id']):
