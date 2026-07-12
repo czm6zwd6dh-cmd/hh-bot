@@ -7,9 +7,10 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
-from openai import AsyncOpenAI  # <-- Используем асинхронный клиент
+from openai import AsyncOpenAI
 import httpx
 import aiohttp
+import aiosqlite  # <-- асинхронная SQLite
 import random
 from fastapi import FastAPI, Request
 import uvicorn
@@ -31,10 +32,8 @@ client = None
 
 if DEEPSEEK_API_KEY:
     try:
-        # Используем асинхронный HTTP клиент
         http_client = httpx.AsyncClient(timeout=30.0, follow_redirects=True)
         client = AsyncOpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com/v1", http_client=http_client)
-        # Тестовый запрос
         asyncio.run(client.chat.completions.create(
             model="deepseek-chat", 
             messages=[{"role": "user", "content": "Привет"}], 
@@ -50,69 +49,57 @@ else:
 
 DB_PATH = "vacancies.db"
 
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("""CREATE TABLE IF NOT EXISTS sent_vacancies (
-        id TEXT PRIMARY KEY, 
-        title TEXT, 
-        company TEXT, 
-        sent_at TIMESTAMP
-    )""")
-    c.execute("""CREATE TABLE IF NOT EXISTS search_log (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, 
-        found_count INTEGER, 
-        sent_count INTEGER, 
-        searched_at TIMESTAMP
-    )""")
-    conn.commit()
-    conn.close()
+async def init_db():
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""CREATE TABLE IF NOT EXISTS sent_vacancies (
+            id TEXT PRIMARY KEY, 
+            title TEXT, 
+            company TEXT, 
+            sent_at TIMESTAMP
+        )""")
+        await db.execute("""CREATE TABLE IF NOT EXISTS search_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, 
+            found_count INTEGER, 
+            sent_count INTEGER, 
+            searched_at TIMESTAMP
+        )""")
+        await db.commit()
 
-def is_vacancy_sent(vacancy_id):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT 1 FROM sent_vacancies WHERE id = ?", (vacancy_id,))
-    result = c.fetchone() is not None
-    conn.close()
-    return result
+async def is_vacancy_sent(vacancy_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT 1 FROM sent_vacancies WHERE id = ?", (vacancy_id,)) as cursor:
+            row = await cursor.fetchone()
+            return row is not None
 
-def mark_vacancy_sent(vacancy_id, title, company):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("INSERT OR IGNORE INTO sent_vacancies VALUES (?, ?, ?, ?)", 
-              (vacancy_id, title, company, datetime.now()))
-    conn.commit()
-    conn.close()
+async def mark_vacancy_sent(vacancy_id, title, company):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT OR IGNORE INTO sent_vacancies VALUES (?, ?, ?, ?)", 
+                        (vacancy_id, title, company, datetime.now()))
+        await db.commit()
 
-def log_search(found, sent):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("INSERT INTO search_log (found_count, sent_count, searched_at) VALUES (?, ?, ?)", 
-              (found, sent, datetime.now()))
-    conn.commit()
-    conn.close()
+async def log_search(found, sent):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT INTO search_log (found_count, sent_count, searched_at) VALUES (?, ?, ?)", 
+                        (found, sent, datetime.now()))
+        await db.commit()
 
-def get_stats():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT COUNT(*) FROM sent_vacancies")
-    total_sent = c.fetchone()[0]
-    c.execute("SELECT COUNT(*) FROM search_log")
-    total_searches = c.fetchone()[0]
-    c.execute("SELECT found_count, sent_count, searched_at FROM search_log ORDER BY searched_at DESC LIMIT 5")
-    recent = c.fetchall()
-    conn.close()
-    return total_sent, total_searches, recent
+async def get_stats():
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT COUNT(*) FROM sent_vacancies") as cursor:
+            total_sent = (await cursor.fetchone())[0]
+        async with db.execute("SELECT COUNT(*) FROM search_log") as cursor:
+            total_searches = (await cursor.fetchone())[0]
+        async with db.execute("SELECT found_count, sent_count, searched_at FROM search_log ORDER BY searched_at DESC LIMIT 5") as cursor:
+            recent = await cursor.fetchall()
+        return total_sent, total_searches, recent
 
-def cleanup_old_vacancies(days=30):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    cutoff = datetime.now() - timedelta(days=days)
-    c.execute("DELETE FROM sent_vacancies WHERE sent_at < ?", (cutoff,))
-    deleted = c.rowcount
-    conn.commit()
-    conn.close()
-    return deleted
+async def cleanup_old_vacancies(days=30):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cutoff = datetime.now() - timedelta(days=days)
+        await db.execute("DELETE FROM sent_vacancies WHERE sent_at < ?", (cutoff,))
+        deleted = db.total_changes
+        await db.commit()
+        return deleted
 
 USER_FILTERS = {
     "salary_min": 200000,
@@ -464,12 +451,18 @@ async def background_search(context: ContextTypes.DEFAULT_TYPE):
 
     seen = set()
     unique = [v for v in all_vacancies if not (v['id'] in seen or seen.add(v['id']))]
-    new_vacancies = [v for v in unique if not is_vacancy_sent(v['id'])]
+    
+    # Асинхронная проверка отправленных
+    new_vacancies = []
+    for v in unique:
+        if not await is_vacancy_sent(v['id']):
+            new_vacancies.append(v)
+    
     logger.info(f"Найдено {len(unique)} уникальных, новых: {len(new_vacancies)}")
 
     if not new_vacancies:
         await context.bot.send_message(chat_id=chat_id, text="🔍 Новых вакансий не найдено.")
-        log_search(0, 0)
+        await log_search(0, 0)
         return
 
     keyword_filtered = [v for v in new_vacancies if is_relevant_by_keywords(v)]
@@ -479,11 +472,11 @@ async def background_search(context: ContextTypes.DEFAULT_TYPE):
     for v in keyword_filtered:
         if await ask_deepseek(v):
             matched.append(v)
-            mark_vacancy_sent(v['id'], v.get('name', ''), v.get('employer', {}).get('name', ''))
+            await mark_vacancy_sent(v['id'], v.get('name', ''), v.get('employer', {}).get('name', ''))
         await asyncio.sleep(0.5)
 
     logger.info(f"После фильтрации: {len(matched)}")
-    log_search(len(unique), len(matched))
+    await log_search(len(unique), len(matched))
     ds_status = "✅ с AI-фильтром" if deepseek_available else "⚠️ без AI"
 
     if matched:
@@ -530,7 +523,7 @@ async def search_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✅ Поиск завершён!")
     except Exception as e:
         logger.error(f"Ошибка в search_now: {e}", exc_info=True)
-        await update.message.reply_text(f"⚠️ Ошибка: {str(e)[:200]}")
+        await update.message.reply_text(f"⚠️ Ошибка поиска: {str(e)[:300]}")
 
 async def schedule_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -554,7 +547,7 @@ async def schedule_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        total_sent, total_searches, recent = get_stats()
+        total_sent, total_searches, recent = await get_stats()
         text = f"📊 Статистика:\n\n• Всего отправлено: {total_sent}\n• Всего поисков: {total_searches}\n\n"
         if recent:
             text += "Последние поиски:\n"
@@ -587,7 +580,7 @@ async def relocate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🌍 Города: Волгоград, Астана, Баку, Казань, Минск, Нижний Новгород, Уфа")
 
 async def cleanup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    deleted = cleanup_old_vacancies(days=30)
+    deleted = await cleanup_old_vacancies(days=30)
     await update.message.reply_text(f"🗑 Удалено {deleted} старых записей")
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -621,7 +614,7 @@ async def health():
 async def webhook(request: Request):
     data = await request.json()
     update = Update.de_json(data, application.bot)
-    await application.process_update(update)  # <-- await добавлен
+    await application.process_update(update)
     return {"ok": True}
 
 application = None
@@ -633,7 +626,7 @@ async def keep_alive_ping():
 
 async def run_webhook():
     global application
-    init_db()
+    await init_db()
 
     application = Application.builder().token(TELEGRAM_TOKEN).build()
     application.add_handler(CommandHandler("start", start))
@@ -647,19 +640,16 @@ async def run_webhook():
     application.add_handler(CommandHandler("help", help_cmd))
     application.add_error_handler(error_handler)
 
-    # ВСЕ await добавлены
     await application.initialize()
     await application.start()
 
     if RENDER_EXTERNAL_URL:
         webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
-        await application.bot.set_webhook(url=webhook_url)  # <-- await
+        await application.bot.set_webhook(url=webhook_url)
         logger.info(f"🔗 Webhook установлен: {webhook_url}")
 
-    # Запускаем keep-alive как фоновую задачу
     asyncio.create_task(keep_alive_ping())
 
-    # Запускаем uvicorn
     config = uvicorn.Config(app, host="0.0.0.0", port=10000, log_level="info")
     server = uvicorn.Server(config)
     await server.serve()
