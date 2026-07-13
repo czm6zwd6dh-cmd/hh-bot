@@ -132,7 +132,7 @@ def reload_profile():
     logger.info("Profile reloaded from YAML")
 
 def init_deepseek_client():
-    global deepseek_available, client
+    global client
     if not DEEPSEEK_API_KEY:
         logger.warning("DEEPSEEK_API_KEY не задан")
         return
@@ -1282,6 +1282,10 @@ async def run_webhook():
     application.add_error_handler(error_handler)
     await application.initialize()
     await application.start()
+    
+    # ← ПРОВЕРКА DEEPEEK ПЕРЕД УСТАНОВКОЙ WEBHOOK
+    await check_deepseek_connection()
+    
     if RENDER_EXTERNAL_URL:
         webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
         await application.bot.set_webhook(url=webhook_url)
