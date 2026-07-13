@@ -471,16 +471,25 @@ async def ask_deepseek_scoring(vacancy: dict) -> Optional[VacancyScore]:
     if not client:
         return None
     profile_text = yaml.dump(PROFILE["candidate"], allow_unicode=True)
-    vacancy_text = "Название: " + vacancy.get("name", "") + "\n"
-    vacancy_text += "Компания: " + vacancy.get("employer", {}).get("name", "") + "\n"
-    vacancy_text += "Город: " + vacancy.get("area", {}).get("name", "") + "\n"
+    vacancy_text = "Название: " + vacancy.get("name", "") + "
+"
+    vacancy_text += "Компания: " + vacancy.get("employer", {}).get("name", "") + "
+"
+    vacancy_text += "Город: " + vacancy.get("area", {}).get("name", "") + "
+"
     salary = vacancy.get("salary", {})
-    vacancy_text += "Зарплата: " + str(salary.get("from", "")) + " - " + str(salary.get("to", "")) + " " + str(salary.get("currency", "")) + "\n"
-    vacancy_text += "Требования: " + vacancy.get("snippet", {}).get("requirement", "") + "\n"
-    vacancy_text += "Обязанности: " + vacancy.get("snippet", {}).get("responsibility", "") + "\n"
+    vacancy_text += "Зарплата: " + str(salary.get("from", "")) + " - " + str(salary.get("to", "")) + " " + str(salary.get("currency", "")) + "
+"
+    vacancy_text += "Требования: " + vacancy.get("snippet", {}).get("requirement", "") + "
+"
+    vacancy_text += "Обязанности: " + vacancy.get("snippet", {}).get("responsibility", "") + "
+"
     desc = vacancy.get("description", "")
     vacancy_text += "Описание: " + desc[:1500]
-    prompt = SCORING_PROMPT.format(profile=profile_text) + "\n\n=== ВАКАНСИЯ ===\n" + vacancy_text
+    prompt = SCORING_PROMPT.format(profile=profile_text) + "
+
+=== ВАКАНСИЯ ===
+" + vacancy_text
     try:
         response = await asyncio.wait_for(
             client.chat.completions.create(
@@ -608,7 +617,7 @@ async def ask_rag_about_vacancy(vacancy: dict, question: str) -> Optional[str]:
         deepseek_available = False
         return "⚠️ Ошибка при обработке вопроса"
 
-# ========== SCRAPING ==========
+# ========== SCRAPING (ОБНОВЛЁННЫЙ ПОРЯДОК ЗАПРОСОВ) ==========
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -660,68 +669,112 @@ class RateLimiter:
 
 hh_rate_limiter = RateLimiter(min_delay=2.0, max_delay=5.0)
 
+# ─── НОВЫЙ ПОРЯДОК: сначала прямой запрос, потом ScraperAPI fallback ───
+
+async def _try_fetch(session, urls_to_try, headers, timeout, city_id, keyword, source_name="RSS"):
+    """Пробует список URL: сначала прямой, потом через прокси. Логирует каждый шаг."""
+    for idx, url in enumerate(urls_to_try):
+        is_direct = (idx == 0 and not SCRAPERAPI_KEY) or (idx == 0 and "scraperapi" not in url)
+        via = "DIRECT" if is_direct else "SCRAPERAPI"
+        logger.info(f"[{source_name}] Попытка {idx+1}/{len(urls_to_try)} ({via}): {url[:80]}...")
+
+        try:
+            async with session.get(url, headers=headers, timeout=timeout) as resp:
+                logger.info(f"[{source_name}] {via} -> статус {resp.status} для {city_id}/{keyword}")
+
+                if resp.status == 200:
+                    text = await resp.text()
+                    hh_rate_limiter.on_success()
+                    logger.info(f"[{source_name}] {via} -> УСПЕХ, получено {len(text)} байт")
+                    return text, 200, via
+                elif resp.status in (403, 429):
+                    logger.warning(f"[{source_name}] {via} -> БЛОКИРОВКА ({resp.status}) для {city_id}/{keyword}")
+                    hh_rate_limiter.on_429()
+                    # Продолжаем к следующему URL
+                else:
+                    logger.warning(f"[{source_name}] {via} -> ошибка {resp.status} для {city_id}/{keyword}")
+                    # Пробуем следующий URL
+
+        except asyncio.TimeoutError:
+            logger.warning(f"[{source_name}] {via} -> ТАЙМАУТ для {city_id}/{keyword}")
+        except Exception as e:
+            logger.error(f"[{source_name}] {via} -> ОШИБКА: {e} для {city_id}/{keyword}")
+
+    return None, 0, "FAILED"
+
 async def fetch_rss(session, city_id, keyword, per_page=20, retries=3):
+    """Сначала прямой запрос к HH.ru, потом через ScraperAPI fallback."""
     encoded_kw = keyword.replace(" ", "+")
     target_url = f"https://hh.ru/search/vacancy/rss?text={encoded_kw}&area={city_id}&items_on_page={per_page}"
-    url = build_scraperapi_url(target_url, use_render=False)
+
+    # НОВЫЙ ПОРЯДОК: сначала прямой, потом ScraperAPI
+    urls_to_try = [target_url]  # прямой запрос к hh.ru
+    if SCRAPERAPI_KEY:
+        urls_to_try.append(build_scraperapi_url(target_url))  # fallback через ScraperAPI
+
     headers = {
         "User-Agent": random.choice(USER_AGENTS),
         "Accept": "application/rss+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
     }
+
     for attempt in range(retries):
         await hh_rate_limiter.wait()
-        try:
-            timeout = aiohttp.ClientTimeout(total=30, connect=10)
-            async with session.get(url, headers=headers, timeout=timeout) as resp:
-                return await _handle_rss_response(resp, city_id, keyword)
-        except asyncio.TimeoutError:
-            logger.warning(f"Таймаут RSS {city_id}/{keyword}, попытка {attempt+1}/{retries}")
+        logger.info(f"[RSS] Попытка {attempt+1}/{retries} для {city_id}/{keyword}")
+
+        xml_text, status, via = await _try_fetch(
+            session, urls_to_try, headers, 
+            aiohttp.ClientTimeout(total=30, connect=10),
+            city_id, keyword, "RSS"
+        )
+
+        if xml_text and status == 200:
+            logger.info(f"[RSS] Успешно через {via} для {city_id}/{keyword}")
+            return parse_rss(xml_text)
+        elif status in (403, 429):
+            logger.warning(f"[RSS] Все способы заблокированы ({status}), попытка {attempt+1}/{retries}")
             await asyncio.sleep(min(2 ** attempt + random.uniform(1, 3), 10))
-        except Exception as e:
-            logger.error(f"Ошибка RSS {city_id}/{keyword}: {e}, попытка {attempt+1}/{retries}")
+        else:
+            logger.warning(f"[RSS] Не удалось получить данные, попытка {attempt+1}/{retries}")
             await asyncio.sleep(min(2 ** attempt + random.uniform(1, 3), 10))
+
+    logger.error(f"[RSS] ИСЧЕРПАНЫ ВСЕ ПОПЫТКИ для {city_id}/{keyword}. Возможно, нужен официальный API HH.ru (требуется токен).")
     return []
 
-async def _handle_rss_response(resp, city_id, keyword):
-    if resp.status == 200:
-        xml_text = await resp.text()
-        logger.info(f"RSS {city_id}/{keyword}: получено {len(xml_text)} байт")
-        hh_rate_limiter.on_success()
-        return parse_rss(xml_text)
-    elif resp.status in (403, 429):
-        logger.warning(f"HH RSS {resp.status} для {city_id}/{keyword}")
-        hh_rate_limiter.on_429()
-        return []
-    else:
-        logger.warning(f"HH RSS {resp.status} для {city_id}/{keyword}")
-        return []
-
 async def fetch_html_fallback(session, city_id, keyword="коммерческий директор"):
+    """Сначала прямой запрос к HH.ru, потом через ScraperAPI fallback."""
     encoded_kw = keyword.replace(" ", "+")
     target_url = f"https://hh.ru/search/vacancy?text={encoded_kw}&area={city_id}&items_on_page=20"
-    url = build_scraperapi_url(target_url, use_render=False)
+
+    # НОВЫЙ ПОРЯДОК: сначала прямой, потом ScraperAPI
+    urls_to_try = [target_url]  # прямой запрос к hh.ru
+    if SCRAPERAPI_KEY:
+        urls_to_try.append(build_scraperapi_url(target_url))  # fallback через ScraperAPI
+
     headers = {
         "User-Agent": random.choice(USER_AGENTS),
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
         "Accept-Language": "ru-RU,ru;q=0.9",
     }
+
     await hh_rate_limiter.wait()
-    try:
-        timeout = aiohttp.ClientTimeout(total=30, connect=10)
-        async with session.get(url, headers=headers, timeout=timeout) as resp:
-            if resp.status == 200:
-                html = await resp.text()
-                hh_rate_limiter.on_success()
-                return parse_html_vacancies(html, city_id)
-            elif resp.status == 429:
-                hh_rate_limiter.on_429()
-                return []
-            else:
-                return []
-    except Exception as e:
-        logger.error(f"HTML fallback ошибка: {e}")
-        return []
+    logger.info(f"[HTML] Запрос для {city_id}/{keyword}")
+
+    html, status, via = await _try_fetch(
+        session, urls_to_try, headers,
+        aiohttp.ClientTimeout(total=30, connect=10),
+        city_id, keyword, "HTML"
+    )
+
+    if html and status == 200:
+        logger.info(f"[HTML] Успешно через {via} для {city_id}/{keyword}")
+        return parse_html_vacancies(html, city_id)
+    elif status in (403, 429):
+        logger.error(f"[HTML] ВСЕ СПОСОБЫ ЗАБЛОКИРОВАНЫ ({status}) для {city_id}/{keyword}. Нужен официальный API HH.ru.")
+    else:
+        logger.error(f"[HTML] Не удалось получить HTML для {city_id}/{keyword}")
+
+    return []
 
 def parse_html_vacancies(html, city_id):
     vacancies = []
@@ -807,30 +860,52 @@ def format_vacancy_message(vacancy: dict, score: VacancyScore, cover_letter: str
     desc_clean = re.sub("<[^<]+?>", "", desc)
     desc_short = desc_clean[:350] + "..." if len(desc_clean) > 350 else desc_clean
     url = vacancy.get("alternate_url", "")
-    msg = "━━━━━━━━━━━━━━━━━━━━\n"
-    msg += "🔹 " + name + "\n"
-    msg += "🏢 " + company + "\n"
-    msg += "📍 " + city + "\n"
-    msg += "💰 " + salary_text + "\n"
-    msg += "📊 Скор: " + str(score.total) + "/100 " + score_bar + "\n"
-    msg += "   Роль: " + str(score.role_fit) + " | Индустрия: " + str(score.industry_match) + " | ЗП: " + str(score.salary_match) + "\n"
-    msg += "   Локация: " + str(score.location_match) + " | Опыт: " + str(score.experience_match) + " | Навыки: " + str(score.skills_match) + "\n"
-    msg += "🎯 Вердикт: " + score.verdict + "\n"
-    msg += "💡 " + score.reasoning + "\n\n"
-    msg += "📋 Описание:\n"
-    msg += desc_short + "\n\n"
+    msg = "━━━━━━━━━━━━━━━━━━━━
+"
+    msg += "🔹 " + name + "
+"
+    msg += "🏢 " + company + "
+"
+    msg += "📍 " + city + "
+"
+    msg += "💰 " + salary_text + "
+"
+    msg += "📊 Скор: " + str(score.total) + "/100 " + score_bar + "
+"
+    msg += "   Роль: " + str(score.role_fit) + " | Индустрия: " + str(score.industry_match) + " | ЗП: " + str(score.salary_match) + "
+"
+    msg += "   Локация: " + str(score.location_match) + " | Опыт: " + str(score.experience_match) + " | Навыки: " + str(score.skills_match) + "
+"
+    msg += "🎯 Вердикт: " + score.verdict + "
+"
+    msg += "💡 " + score.reasoning + "
+
+"
+    msg += "📋 Описание:
+"
+    msg += desc_short + "
+
+"
     msg += "🔗 " + url
     if cover_letter:
-        msg += "\n\n📝 Сопроводительное письмо:\n" + cover_letter[:500] + "..."
-    msg += "\n━━━━━━━━━━━━━━━━━━━━"
+        msg += "
+
+📝 Сопроводительное письмо:
+" + cover_letter[:500] + "..."
+    msg += "
+━━━━━━━━━━━━━━━━━━━━"
     return msg
 
 def format_digest(vacancies: List[tuple]) -> str:
-    msg = "📋 Дайджест вакансий\n\n"
+    msg = "📋 Дайджест вакансий
+
+"
     for i, (vid, title, company, score, _) in enumerate(vacancies[:10], 1):
         bar = "█" * int(score / 10) + "░" * (10 - int(score / 10))
-        msg += str(i) + ". [" + str(int(score)) + "] " + bar + " " + title + " — " + company + "\n"
-    msg += "\nВсего: " + str(len(vacancies)) + " вакансий. Подробности: /top"
+        msg += str(i) + ". [" + str(int(score)) + "] " + bar + " " + title + " — " + company + "
+"
+    msg += "
+Всего: " + str(len(vacancies)) + " вакансий. Подробности: /top"
     return msg
 
 # ========== BACKGROUND SEARCH ==========
@@ -956,26 +1031,50 @@ async def background_search(context: ContextTypes.DEFAULT_TYPE):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ds_status = "✅" if deepseek_available else "❌"
     scraper_status = "✅" if SCRAPERAPI_KEY else "❌"
-    text = "👋 Привет! Я ищу вакансии коммерческого директора в нефтянке.\n\n"
-    text += f"🤖 DeepSeek: {ds_status}\n🌐 ScraperAPI: {scraper_status}\n📡 HH.ru (RSS + HTML)\n"
-    text += "📊 Скоринг: 0-100 с разбивкой по 6 критериям\n"
-    text += "📝 Генерация сопроводительных писем\n"
-    text += "📋 Трекинг откликов (Kanban-style)\n\n"
-    text += "Команды:\n"
-    text += "/search — поиск сейчас\n"
-    text += "/schedule on/off — авто-поиск\n"
-    text += "/stats — статистика\n"
-    text += "/top — топ вакансий по скору\n"
-    text += "/digest — дайджест слабых совпадений\n"
-    text += "/applications — трекинг откликов\n"
-    text += "/status [id] [status] — обновить статус\n"
-    text += "/profile — показать профиль\n"
-    text += "/editprofile — редактировать профиль\n"
-    text += "/filters — фильтры\n"
-    text += "/salary [сумма] — зарплата\n"
-    text += "/blacklist [компания] — чёрный список\n"
-    text += "/relocate — города\n"
-    text += "/cleanup — очистить\n"
+    text = "👋 Привет! Я ищу вакансии коммерческого директора в нефтянке.
+
+"
+    text += f"🤖 DeepSeek: {ds_status}
+🌐 ScraperAPI: {scraper_status}
+📡 HH.ru (RSS + HTML)
+"
+    text += "📊 Скоринг: 0-100 с разбивкой по 6 критериям
+"
+    text += "📝 Генерация сопроводительных писем
+"
+    text += "📋 Трекинг откликов (Kanban-style)
+
+"
+    text += "Команды:
+"
+    text += "/search — поиск сейчас
+"
+    text += "/schedule on/off — авто-поиск
+"
+    text += "/stats — статистика
+"
+    text += "/top — топ вакансий по скору
+"
+    text += "/digest — дайджест слабых совпадений
+"
+    text += "/applications — трекинг откликов
+"
+    text += "/status [id] [status] — обновить статус
+"
+    text += "/profile — показать профиль
+"
+    text += "/editprofile — редактировать профиль
+"
+    text += "/filters — фильтры
+"
+    text += "/salary [сумма] — зарплата
+"
+    text += "/blacklist [компания] — чёрный список
+"
+    text += "/relocate — города
+"
+    text += "/cleanup — очистить
+"
     text += "/help — справка"
     await update.message.reply_text(text)
 
@@ -1003,9 +1102,11 @@ async def schedule_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.info(f"Удалён старый job: {job}")
     if not context.args:
         if existing_jobs:
-            await update.message.reply_text("⏰ Авто-поиск активен (9:00 и 18:00 UTC)\nОтключить: /schedule off")
+            await update.message.reply_text("⏰ Авто-поиск активен (9:00 и 18:00 UTC)
+Отключить: /schedule off")
         else:
-            await update.message.reply_text("❌ Авто-поиск отключен\nВключить: /schedule on")
+            await update.message.reply_text("❌ Авто-поиск отключен
+Включить: /schedule on")
         return
     command = context.args[0].lower()
     if command == "off":
@@ -1025,20 +1126,34 @@ async def schedule_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chat_id=chat_id,
             name="auto_search"
         )
-        await update.message.reply_text("✅ Авто-поиск включён!\n• 9:00 UTC\n• 18:00 UTC\nОтключить: /schedule off")
+        await update.message.reply_text("✅ Авто-поиск включён!
+• 9:00 UTC
+• 18:00 UTC
+Отключить: /schedule off")
 
 async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         total_sent, total_seen, total_searches, recent, app_stats = await get_stats()
-        text = f"📊 Статистика:\n\n• Отправлено: {total_sent}\n• Просмотрено: {total_seen}\n• Поисков: {total_searches}\n"
+        text = f"📊 Статистика:
+
+• Отправлено: {total_sent}
+• Просмотрено: {total_seen}
+• Поисков: {total_searches}
+"
         if app_stats:
-            text += "\n📋 Отклики:\n"
+            text += "
+📋 Отклики:
+"
             for status, count in app_stats.items():
-                text += f"  {status}: {count}\n"
+                text += f"  {status}: {count}
+"
         if recent:
-            text += "\nПоследние поиски:\n"
+            text += "
+Последние поиски:
+"
             for found, sent, avg_score, when in recent:
-                text += f"  {str(when)[:16]} — найдено {found}, подошло {sent}, средний скор {avg_score:.1f}\n"
+                text += f"  {str(when)[:16]} — найдено {found}, подошло {sent}, средний скор {avg_score:.1f}
+"
         await update.message.reply_text(text)
     except Exception as e:
         logger.error(f"Ошибка stats: {e}")
@@ -1050,10 +1165,13 @@ async def top_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not top:
             await update.message.reply_text("📭 Пока нет сохранённых вакансий")
             return
-        msg = "🏆 Топ вакансий по скору:\n\n"
+        msg = "🏆 Топ вакансий по скору:
+
+"
         for i, (vid, title, company, score, sent_at) in enumerate(top, 1):
             bar = "█" * int(score / 10) + "░" * (10 - int(score / 10))
-            msg += f"{i}. [{score:.0f}] {bar} {title} — {company}\n"
+            msg += f"{i}. [{score:.0f}] {bar} {title} — {company}
+"
         await update.message.reply_text(msg)
     except Exception as e:
         await update.message.reply_text(f"⚠️ Ошибка: {str(e)[:200]}")
@@ -1079,13 +1197,17 @@ async def applications_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not apps:
             await update.message.reply_text("📭 Пока нет отслеживаемых вакансий")
             return
-        msg = "📋 Трекинг откликов:\n\n"
+        msg = "📋 Трекинг откликов:
+
+"
         status_emoji = {"new": "🆕", "applied": "📨", "interview": "🗣", "offer": "🎉", "rejected": "❌", "ghosted": "👻"}
         for row in apps[:15]:
             _, vid, title, company, score, status, _, _, _ = row
             emoji = status_emoji.get(status, "🆕")
-            msg += f"{emoji} [{score:.0f}] {title} — {company} ({status})\n"
-        msg += "\nОбновить статус: /status [id] [new|applied|interview|offer|rejected|ghosted]"
+            msg += f"{emoji} [{score:.0f}] {title} — {company} ({status})
+"
+        msg += "
+Обновить статус: /status [id] [new|applied|interview|offer|rejected|ghosted]"
         await update.message.reply_text(msg)
     except Exception as e:
         await update.message.reply_text(f"⚠️ Ошибка: {str(e)[:200]}")
@@ -1122,24 +1244,41 @@ async def cover_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def profile_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reload_profile()
     p = PROFILE["candidate"]
-    msg = "👤 Профиль:\n\n"
-    msg += f"Имя: {p['name']}\n"
-    msg += f"Возраст: {p['age']}\n"
-    msg += f"Город: {p['city']}\n"
-    msg += f"Переезд: {', '.join(p['relocation_ready'])}\n"
-    msg += f"Должности: {', '.join(p['desired_positions'])}\n"
-    msg += f"Мин. зарплата: {p['salary_min']} ₽\n"
-    msg += "\nКлючевые навыки:\n"
+    msg = "👤 Профиль:
+
+"
+    msg += f"Имя: {p['name']}
+"
+    msg += f"Возраст: {p['age']}
+"
+    msg += f"Город: {p['city']}
+"
+    msg += f"Переезд: {', '.join(p['relocation_ready'])}
+"
+    msg += f"Должности: {', '.join(p['desired_positions'])}
+"
+    msg += f"Мин. зарплата: {p['salary_min']} ₽
+"
+    msg += "
+Ключевые навыки:
+"
     for skill in p["key_skills"]:
-        msg += f"  • {skill}\n"
-    msg += "\nРедактировать: /editprofile"
+        msg += f"  • {skill}
+"
+    msg += "
+Редактировать: /editprofile"
     await update.message.reply_text(msg)
 
 async def editprofile_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = "✏️ Редактирование профиля:\n"
-    text += "Отредактируйте файл profile.yaml в репозитории и перезапустите бота.\n\n"
-    text += "Или используйте команды:\n"
-    text += "/salary [сумма] — изменить мин. зарплату\n"
+    text = "✏️ Редактирование профиля:
+"
+    text += "Отредактируйте файл profile.yaml в репозитории и перезапустите бота.
+
+"
+    text += "Или используйте команды:
+"
+    text += "/salary [сумма] — изменить мин. зарплату
+"
     text += "/blacklist [компания] — добавить в чёрный список"
     await update.message.reply_text(text)
 
@@ -1148,10 +1287,14 @@ async def filters_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cities_str = ", ".join(PROFILE["filters"]["cities"].keys())
     bl = PROFILE["filters"].get("company_blacklist", [])
     bl_str = ", ".join(bl) if bl else "(пусто)"
-    text = "🔧 Фильтры:\n"
-    text += f"• Мин. зарплата: {PROFILE['filters']['salary_min']} ₽\n"
-    text += f"• Города: {cities_str}\n"
-    text += f"• Чёрный список компаний: {bl_str}\n"
+    text = "🔧 Фильтры:
+"
+    text += f"• Мин. зарплата: {PROFILE['filters']['salary_min']} ₽
+"
+    text += f"• Города: {cities_str}
+"
+    text += f"• Чёрный список компаний: {bl_str}
+"
     text += f"• Макс. за цикл: {PROFILE['notifications'].get('max_per_cycle', MAX_PUSH_PER_CYCLE)}"
     await update.message.reply_text(text)
 
@@ -1197,21 +1340,36 @@ async def cleanup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"🗑 Удалено {deleted} старых записей")
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = "📖 Команды:\n"
-    text += "/search — поиск сейчас\n"
-    text += "/schedule on/off — авто-поиск\n"
-    text += "/stats — статистика\n"
-    text += "/top — топ вакансий\n"
-    text += "/digest — дайджест слабых совпадений\n"
-    text += "/applications — трекинг откликов\n"
-    text += "/status [id] [status] — обновить статус\n"
-    text += "/profile — профиль\n"
-    text += "/editprofile — редактировать профиль\n"
-    text += "/filters — фильтры\n"
-    text += "/salary [сумма] — зарплата\n"
-    text += "/blacklist [компания] — чёрный список\n"
-    text += "/relocate — города\n"
-    text += "/cleanup — очистить\n"
+    text = "📖 Команды:
+"
+    text += "/search — поиск сейчас
+"
+    text += "/schedule on/off — авто-поиск
+"
+    text += "/stats — статистика
+"
+    text += "/top — топ вакансий
+"
+    text += "/digest — дайджест слабых совпадений
+"
+    text += "/applications — трекинг откликов
+"
+    text += "/status [id] [status] — обновить статус
+"
+    text += "/profile — профиль
+"
+    text += "/editprofile — редактировать профиль
+"
+    text += "/filters — фильтры
+"
+    text += "/salary [сумма] — зарплата
+"
+    text += "/blacklist [компания] — чёрный список
+"
+    text += "/relocate — города
+"
+    text += "/cleanup — очистить
+"
     text += "/help — справка"
     await update.message.reply_text(text)
 
@@ -1220,7 +1378,7 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update and update.effective_message:
         await update.effective_message.reply_text("⚠️ Ошибка. Попробуйте позже.")
 
-# ========== WEB SERVER + WEBHOOK ==========
+# ========== WEB SERVER + WEBHOOK + TEST ENDPOINT ==========
 app = FastAPI()
 
 @app.get("/")
@@ -1255,6 +1413,75 @@ async def webhook(request: Request):
     await application.process_update(update)
     return {"ok": True}
 
+# ─── НОВЫЙ ТЕСТОВЫЙ ЭНДПОИНТ: проверяем поиск без Telegram ───
+@app.get("/test_search")
+async def test_search():
+    """Тестовый поиск вакансий — проверяет работу scraping без Telegram."""
+    import time
+    start_time = time.time()
+    results = {
+        "status": "running",
+        "timestamp": datetime.now().isoformat(),
+        "tests": [],
+        "total_vacancies_found": 0,
+        "errors": []
+    }
+
+    test_keywords = ["коммерческий директор", "директор по продажам"]
+    test_cities = [("Москва", "1"), ("Волгоград", "24")]
+
+    async with aiohttp.ClientSession() as session:
+        for city_name, city_id in test_cities:
+            for keyword in test_keywords:
+                test_result = {
+                    "city": city_name,
+                    "keyword": keyword,
+                    "rss": {"status": "pending", "count": 0, "via": None, "error": None},
+                    "html": {"status": "pending", "count": 0, "via": None, "error": None}
+                }
+
+                # Тест RSS
+                try:
+                    rss_vacancies = await fetch_rss(session, city_id, keyword, per_page=5)
+                    test_result["rss"]["count"] = len(rss_vacancies)
+                    test_result["rss"]["status"] = "success" if rss_vacancies else "empty"
+                    results["total_vacancies_found"] += len(rss_vacancies)
+                except Exception as e:
+                    test_result["rss"]["status"] = "error"
+                    test_result["rss"]["error"] = str(e)
+                    results["errors"].append(f"RSS {city_name}/{keyword}: {e}")
+
+                await asyncio.sleep(1)
+
+                # Тест HTML fallback (если RSS пуст)
+                if test_result["rss"]["count"] == 0:
+                    try:
+                        html_vacancies = await fetch_html_fallback(session, city_id, keyword)
+                        test_result["html"]["count"] = len(html_vacancies)
+                        test_result["html"]["status"] = "success" if html_vacancies else "empty"
+                        results["total_vacancies_found"] += len(html_vacancies)
+                    except Exception as e:
+                        test_result["html"]["status"] = "error"
+                        test_result["html"]["error"] = str(e)
+                        results["errors"].append(f"HTML {city_name}/{keyword}: {e}")
+                else:
+                    test_result["html"]["status"] = "skipped"
+
+                results["tests"].append(test_result)
+                await asyncio.sleep(1)
+
+    results["elapsed_seconds"] = round(time.time() - start_time, 2)
+    results["status"] = "completed"
+
+    if results["total_vacancies_found"] == 0 and not results["errors"]:
+        results["recommendation"] = "Все способы заблокированы. Нужен официальный API HH.ru (требуется токен)."
+    elif results["total_vacancies_found"] > 0:
+        results["recommendation"] = "Поиск работает! Прямые запросы проходят."
+    else:
+        results["recommendation"] = "Есть ошибки. Проверьте логи."
+
+    return results
+
 application = None
 
 async def run_webhook():
@@ -1282,10 +1509,10 @@ async def run_webhook():
     application.add_error_handler(error_handler)
     await application.initialize()
     await application.start()
-    
-    # ← ПРОВЕРКА DEEPEEK ПЕРЕД УСТАНОВКОЙ WEBHOOK
+
+    # ПРОВЕРКА DEEPEEK ПЕРЕД УСТАНОВКОЙ WEBHOOK
     await check_deepseek_connection()
-    
+
     if RENDER_EXTERNAL_URL:
         webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
         await application.bot.set_webhook(url=webhook_url)
@@ -1296,4 +1523,3 @@ async def run_webhook():
 
 if __name__ == "__main__":
     asyncio.run(run_webhook())
- 
