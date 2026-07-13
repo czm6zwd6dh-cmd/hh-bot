@@ -608,7 +608,7 @@ async def ask_rag_about_vacancy(vacancy: dict, question: str) -> Optional[str]:
         deepseek_available = False
         return "⚠️ Ошибка при обработке вопроса"
 
-# ========== SCRAPING ==========
+# ========== SCRAPING (ОФИЦИАЛЬНОЕ API HH.RU + ПРЯМЫЕ ЗАПРОСЫ) ==========
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -616,13 +616,6 @@ USER_AGENTS = [
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 ]
-
-def build_scraperapi_url(target_url, use_render=False):
-    if not SCRAPERAPI_KEY:
-        return target_url
-    if use_render:
-        return f"http://api.scraperapi.com?api_key={SCRAPERAPI_KEY}&url={target_url}&render=true&premium=true"
-    return f"http://api.scraperapi.com?api_key={SCRAPERAPI_KEY}&url={target_url}&premium=true"
 
 class RateLimiter:
     def __init__(self, min_delay=2.0, max_delay=5.0):
@@ -660,48 +653,120 @@ class RateLimiter:
 
 hh_rate_limiter = RateLimiter(min_delay=2.0, max_delay=5.0)
 
-# ─── НОВЫЙ ПОРЯДОК: сначала прямой запрос, потом ScraperAPI fallback ───
+# ─── ОФИЦИАЛЬНОЕ API HH.RU (ПОИСК БЕЗ АВТОРИЗАЦИИ) ───
+# Документация: https://github.com/hhru/api/blob/master/docs/vacancies.md
+# Поиск вакансий — открытый endpoint, не требует токена
 
-async def _try_fetch(session, urls_to_try, headers, timeout, city_id, keyword, source_name="RSS"):
-    """Пробует список URL: сначала прямой, потом через прокси. Логирует каждый шаг."""
-    for idx, url in enumerate(urls_to_try):
-        is_direct = (idx == 0 and not SCRAPERAPI_KEY) or (idx == 0 and "scraperapi" not in url)
-        via = "DIRECT" if is_direct else "SCRAPERAPI"
-        logger.info(f"[{source_name}] Попытка {idx+1}/{len(urls_to_try)} ({via}): {url[:80]}...")
+async def fetch_hh_api(session, city_id, keyword, per_page=20, page=0):
+    """Поиск через официальное API HH.ru (без авторизации)."""
+    encoded_kw = keyword.replace(" ", "+")
+    url = f"https://api.hh.ru/vacancies?text={encoded_kw}&area={city_id}&per_page={per_page}&page={page}"
 
-        try:
-            async with session.get(url, headers=headers, timeout=timeout) as resp:
-                logger.info(f"[{source_name}] {via} -> статус {resp.status} для {city_id}/{keyword}")
+    headers = {
+        "User-Agent": random.choice(USER_AGENTS),
+        "Accept": "application/json",
+        "Accept-Language": "ru-RU,ru;q=0.9",
+    }
 
-                if resp.status == 200:
-                    text = await resp.text()
-                    hh_rate_limiter.on_success()
-                    logger.info(f"[{source_name}] {via} -> УСПЕХ, получено {len(text)} байт")
-                    return text, 200, via
-                elif resp.status in (403, 429):
-                    logger.warning(f"[{source_name}] {via} -> БЛОКИРОВКА ({resp.status}) для {city_id}/{keyword}")
-                    hh_rate_limiter.on_429()
-                    # Продолжаем к следующему URL
-                else:
-                    logger.warning(f"[{source_name}] {via} -> ошибка {resp.status} для {city_id}/{keyword}")
-                    # Пробуем следующий URL
+    await hh_rate_limiter.wait()
+    logger.info(f"[HH-API] Запрос: {keyword} в area={city_id}")
 
-        except asyncio.TimeoutError:
-            logger.warning(f"[{source_name}] {via} -> ТАЙМАУТ для {city_id}/{keyword}")
-        except Exception as e:
-            logger.error(f"[{source_name}] {via} -> ОШИБКА: {e} для {city_id}/{keyword}")
+    try:
+        timeout = aiohttp.ClientTimeout(total=30, connect=10)
+        async with session.get(url, headers=headers, timeout=timeout) as resp:
+            logger.info(f"[HH-API] Статус {resp.status} для {city_id}/{keyword}")
 
-    return None, 0, "FAILED"
+            if resp.status == 200:
+                data = await resp.json()
+                items = data.get("items", [])
+                hh_rate_limiter.on_success()
+                logger.info(f"[HH-API] УСПЕХ: {len(items)} вакансий получено")
+                return items
+            elif resp.status == 403:
+                logger.warning(f"[HH-API] БЛОКИРОВКА (403) — IP в чёрном списке")
+                return None
+            elif resp.status == 429:
+                logger.warning(f"[HH-API] Rate limit (429)")
+                hh_rate_limiter.on_429()
+                return None
+            else:
+                logger.warning(f"[HH-API] Ошибка {resp.status}")
+                return None
+    except asyncio.TimeoutError:
+        logger.warning(f"[HH-API] ТАЙМАУТ для {city_id}/{keyword}")
+        return None
+    except Exception as e:
+        logger.error(f"[HH-API] ОШИБКА: {e}")
+        return None
+
+def hh_api_item_to_vacancy(item):
+    """Конвертирует элемент из API HH.ru в формат вакансии бота."""
+    salary = item.get("salary")
+    salary_dict = None
+    if salary:
+        salary_dict = {
+            "from": salary.get("from"),
+            "to": salary.get("to"),
+            "currency": salary.get("currency", "RUR")
+        }
+
+    employer = item.get("employer", {})
+    area = item.get("area", {})
+
+    vacancy = {
+        "id": str(item.get("id", "")),
+        "name": item.get("name", "Без названия"),
+        "alternate_url": item.get("alternate_url", ""),
+        "employer": {
+            "name": employer.get("name", "Не указана")
+        },
+        "area": {
+            "name": area.get("name", "Не указан")
+        },
+        "salary": salary_dict,
+        "snippet": {
+            "requirement": item.get("snippet", {}).get("requirement", "") or "",
+            "responsibility": item.get("snippet", {}).get("responsibility", "") or ""
+        },
+        "description": (item.get("snippet", {}).get("requirement", "") or "") + " " + 
+                      (item.get("snippet", {}).get("responsibility", "") or ""),
+        "published_at": item.get("published_at", "")
+    }
+    return vacancy
+
+# ─── ПРЯМЫЕ ЗАПРОСЫ (RSS + HTML) — FALLBACK ───
+
+async def _try_direct_fetch(session, url, headers, timeout, city_id, keyword, source_name="RSS"):
+    """Пробует прямой запрос с логированием."""
+    logger.info(f"[{source_name}] DIRECT: {url[:80]}...")
+
+    try:
+        async with session.get(url, headers=headers, timeout=timeout) as resp:
+            logger.info(f"[{source_name}] Статус {resp.status}")
+
+            if resp.status == 200:
+                text = await resp.text()
+                hh_rate_limiter.on_success()
+                logger.info(f"[{source_name}] УСПЕХ: {len(text)} байт")
+                return text, 200
+            elif resp.status in (403, 429):
+                logger.warning(f"[{source_name}] БЛОКИРОВКА ({resp.status})")
+                hh_rate_limiter.on_429()
+                return None, resp.status
+            else:
+                logger.warning(f"[{source_name}] Ошибка {resp.status}")
+                return None, resp.status
+    except asyncio.TimeoutError:
+        logger.warning(f"[{source_name}] ТАЙМАУТ")
+        return None, 0
+    except Exception as e:
+        logger.error(f"[{source_name}] ОШИБКА: {e}")
+        return None, 0
 
 async def fetch_rss(session, city_id, keyword, per_page=20, retries=3):
-    """Сначала прямой запрос к HH.ru, потом через ScraperAPI fallback."""
+    """Прямой RSS-запрос к HH.ru (fallback)."""
     encoded_kw = keyword.replace(" ", "+")
     target_url = f"https://hh.ru/search/vacancy/rss?text={encoded_kw}&area={city_id}&items_on_page={per_page}"
-
-    # НОВЫЙ ПОРЯДОК: сначала прямой, потом ScraperAPI
-    urls_to_try = [target_url]  # прямой запрос к hh.ru
-    if SCRAPERAPI_KEY:
-        urls_to_try.append(build_scraperapi_url(target_url))  # fallback через ScraperAPI
 
     headers = {
         "User-Agent": random.choice(USER_AGENTS),
@@ -713,34 +778,26 @@ async def fetch_rss(session, city_id, keyword, per_page=20, retries=3):
         await hh_rate_limiter.wait()
         logger.info(f"[RSS] Попытка {attempt+1}/{retries} для {city_id}/{keyword}")
 
-        xml_text, status, via = await _try_fetch(
-            session, urls_to_try, headers, 
+        xml_text, status = await _try_direct_fetch(
+            session, target_url, headers,
             aiohttp.ClientTimeout(total=30, connect=10),
             city_id, keyword, "RSS"
         )
 
         if xml_text and status == 200:
-            logger.info(f"[RSS] Успешно через {via} для {city_id}/{keyword}")
             return parse_rss(xml_text)
         elif status in (403, 429):
-            logger.warning(f"[RSS] Все способы заблокированы ({status}), попытка {attempt+1}/{retries}")
             await asyncio.sleep(min(2 ** attempt + random.uniform(1, 3), 10))
         else:
-            logger.warning(f"[RSS] Не удалось получить данные, попытка {attempt+1}/{retries}")
             await asyncio.sleep(min(2 ** attempt + random.uniform(1, 3), 10))
 
-    logger.error(f"[RSS] ИСЧЕРПАНЫ ВСЕ ПОПЫТКИ для {city_id}/{keyword}. Возможно, нужен официальный API HH.ru (требуется токен).")
+    logger.error(f"[RSS] ВСЕ ПОПЫТКИ ИСЧЕРПАНЫ для {city_id}/{keyword}")
     return []
 
 async def fetch_html_fallback(session, city_id, keyword="коммерческий директор"):
-    """Сначала прямой запрос к HH.ru, потом через ScraperAPI fallback."""
+    """Прямой HTML-запрос к HH.ru (fallback)."""
     encoded_kw = keyword.replace(" ", "+")
     target_url = f"https://hh.ru/search/vacancy?text={encoded_kw}&area={city_id}&items_on_page=20"
-
-    # НОВЫЙ ПОРЯДОК: сначала прямой, потом ScraperAPI
-    urls_to_try = [target_url]  # прямой запрос к hh.ru
-    if SCRAPERAPI_KEY:
-        urls_to_try.append(build_scraperapi_url(target_url))  # fallback через ScraperAPI
 
     headers = {
         "User-Agent": random.choice(USER_AGENTS),
@@ -751,21 +808,17 @@ async def fetch_html_fallback(session, city_id, keyword="коммерчески�
     await hh_rate_limiter.wait()
     logger.info(f"[HTML] Запрос для {city_id}/{keyword}")
 
-    html, status, via = await _try_fetch(
-        session, urls_to_try, headers,
+    html, status = await _try_direct_fetch(
+        session, target_url, headers,
         aiohttp.ClientTimeout(total=30, connect=10),
         city_id, keyword, "HTML"
     )
 
     if html and status == 200:
-        logger.info(f"[HTML] Успешно через {via} для {city_id}/{keyword}")
         return parse_html_vacancies(html, city_id)
-    elif status in (403, 429):
-        logger.error(f"[HTML] ВСЕ СПОСОБЫ ЗАБЛОКИРОВАНЫ ({status}) для {city_id}/{keyword}. Нужен официальный API HH.ru.")
     else:
         logger.error(f"[HTML] Не удалось получить HTML для {city_id}/{keyword}")
-
-    return []
+        return []
 
 def parse_html_vacancies(html, city_id):
     vacancies = []
@@ -834,7 +887,6 @@ def parse_rss(xml_text):
     except Exception as e:
         logger.error(f"Ошибка обработки RSS: {e}")
     return vacancies
-
 # ========== FORMATTING ==========
 def format_vacancy_message(vacancy: dict, score: VacancyScore, cover_letter: str = None) -> str:
     name = vacancy.get("name", "Без названия")
@@ -878,6 +930,7 @@ def format_digest(vacancies: List[tuple]) -> str:
     return msg
 
 # ========== BACKGROUND SEARCH ==========
+# ========== BACKGROUND SEARCH ==========
 async def background_search(context: ContextTypes.DEFAULT_TYPE):
     global search_lock, last_search_time
     now = asyncio.get_event_loop().time()
@@ -909,27 +962,45 @@ async def background_search(context: ContextTypes.DEFAULT_TYPE):
                     city_vacancies = []
                     for keyword in PROFILE["filters"]["keywords"]:
                         logger.info(f"Поиск: {keyword} в {city_ru}")
-                        result = await fetch_rss(session, city_id, keyword, per_page=20)
-                        if result:
-                            city_vacancies.extend(result)
+
+                        # СНАЧАЛА: официальное API HH.ru (без авторизации)
+                        api_items = await fetch_hh_api(session, city_id, keyword, per_page=20)
+                        if api_items:
+                            for item in api_items:
+                                city_vacancies.append(hh_api_item_to_vacancy(item))
+                            logger.info(f"[HH-API] {city_ru}/{keyword}: {len(api_items)} вакансий через API")
                         else:
-                            fallback = await fetch_html_fallback(session, city_id, keyword)
-                            city_vacancies.extend(fallback)
+                            # FALLBACK 1: RSS
+                            logger.info(f"[HH-API] Не сработало, пробуем RSS...")
+                            rss_result = await fetch_rss(session, city_id, keyword, per_page=20)
+                            if rss_result:
+                                city_vacancies.extend(rss_result)
+                                logger.info(f"[RSS] {city_ru}/{keyword}: {len(rss_result)} вакансий")
+                            else:
+                                # FALLBACK 2: HTML
+                                logger.info(f"[RSS] Не сработало, пробуем HTML...")
+                                html_result = await fetch_html_fallback(session, city_id, keyword)
+                                city_vacancies.extend(html_result)
+                                logger.info(f"[HTML] {city_ru}/{keyword}: {len(html_result)} вакансий")
+
                         await asyncio.sleep(2 + random.uniform(0, 2))
                     all_vacancies.extend(city_vacancies)
-                    logger.info(f"Город {city_ru}: {len(city_vacancies)} вакансий")
+                    logger.info(f"Город {city_ru}: {len(city_vacancies)} вакансий всего")
                     await asyncio.sleep(3 + random.uniform(1, 3))
+
             seen = set()
             unique = [v for v in all_vacancies if not (v["id"] in seen or seen.add(v["id"]))]
             new_vacancies = []
             for v in unique:
                 if not await is_vacancy_sent(v["id"]) and not await is_vacancy_seen(v["id"]):
                     new_vacancies.append(v)
+
             logger.info(f"Найдено {len(unique)} уникальных, новых: {len(new_vacancies)}")
             if not new_vacancies:
                 await context.bot.send_message(chat_id=chat_id, text="🔍 Новых вакансий не найдено.")
                 await log_search(0, 0, 0)
                 return
+
             scored_vacancies = []
             for v in new_vacancies:
                 if asyncio.get_event_loop().time() - start_time > MAX_SEARCH_TIME:
@@ -953,10 +1024,12 @@ async def background_search(context: ContextTypes.DEFAULT_TYPE):
                 scored_vacancies.append((v, final_score))
                 await mark_vacancy_seen(v["id"], v.get("name", ""), v.get("employer", {}).get("name", ""), final_score.total, final_score.verdict)
                 await asyncio.sleep(0.3)
+
             matches = [(v, s) for v, s in scored_vacancies if s.verdict in ("STRONG_MATCH", "MATCH")]
             matches.sort(key=lambda x: x[1].total, reverse=True)
             max_per_cycle = PROFILE["notifications"].get("max_per_cycle", MAX_PUSH_PER_CYCLE)
             to_send = matches[:max_per_cycle]
+
             for v, s in to_send:
                 if s.total >= 75:
                     cover = await generate_cover_letter(v)
@@ -964,9 +1037,11 @@ async def background_search(context: ContextTypes.DEFAULT_TYPE):
                         v["_cover_letter"] = cover
                 await mark_vacancy_sent(v["id"], v.get("name", ""), v.get("employer", {}).get("name", ""), s.total)
                 await add_application(v["id"], v.get("name", ""), v.get("employer", {}).get("name", ""), s.total)
+
             avg_score = sum(s.total for _, s in matches) / len(matches) if matches else 0
             await log_search(len(unique), len(to_send), avg_score)
             ds_status = "✅ с AI-скорингом" if deepseek_available else "⚠️ эвристический скоринг"
+
             if to_send:
                 await context.bot.send_message(
                     chat_id=chat_id,
@@ -1294,6 +1369,7 @@ async def web_stats():
 
 
 # ─── НОВЫЙ ТЕСТОВЫЙ ЭНДПОИНТ: проверяем поиск без Telegram ───
+# ─── ТЕСТОВЫЙ ЭНДПОИНТ: проверяем поиск без Telegram ───
 @app.get("/test_search")
 async def test_search():
     """Тестовый поиск вакансий — проверяет работу scraping без Telegram."""
@@ -1316,25 +1392,45 @@ async def test_search():
                 test_result = {
                     "city": city_name,
                     "keyword": keyword,
-                    "rss": {"status": "pending", "count": 0, "via": None, "error": None},
-                    "html": {"status": "pending", "count": 0, "via": None, "error": None}
+                    "api": {"status": "pending", "count": 0, "error": None},
+                    "rss": {"status": "pending", "count": 0, "error": None},
+                    "html": {"status": "pending", "count": 0, "error": None}
                 }
 
-                # Тест RSS
+                # Тест 1: Официальное API HH.ru
                 try:
-                    rss_vacancies = await fetch_rss(session, city_id, keyword, per_page=5)
-                    test_result["rss"]["count"] = len(rss_vacancies)
-                    test_result["rss"]["status"] = "success" if rss_vacancies else "empty"
-                    results["total_vacancies_found"] += len(rss_vacancies)
+                    api_items = await fetch_hh_api(session, city_id, keyword, per_page=5)
+                    if api_items:
+                        test_result["api"]["count"] = len(api_items)
+                        test_result["api"]["status"] = "success"
+                        results["total_vacancies_found"] += len(api_items)
+                    else:
+                        test_result["api"]["status"] = "empty_or_blocked"
                 except Exception as e:
-                    test_result["rss"]["status"] = "error"
-                    test_result["rss"]["error"] = str(e)
-                    results["errors"].append(f"RSS {city_name}/{keyword}: {e}")
+                    test_result["api"]["status"] = "error"
+                    test_result["api"]["error"] = str(e)
+                    results["errors"].append(f"API {city_name}/{keyword}: {e}")
 
                 await asyncio.sleep(1)
 
-                # Тест HTML fallback (если RSS пуст)
-                if test_result["rss"]["count"] == 0:
+                # Тест 2: RSS (если API пуст)
+                if test_result["api"]["count"] == 0:
+                    try:
+                        rss_vacancies = await fetch_rss(session, city_id, keyword, per_page=5)
+                        test_result["rss"]["count"] = len(rss_vacancies)
+                        test_result["rss"]["status"] = "success" if rss_vacancies else "empty"
+                        results["total_vacancies_found"] += len(rss_vacancies)
+                    except Exception as e:
+                        test_result["rss"]["status"] = "error"
+                        test_result["rss"]["error"] = str(e)
+                        results["errors"].append(f"RSS {city_name}/{keyword}: {e}")
+                else:
+                    test_result["rss"]["status"] = "skipped"
+
+                await asyncio.sleep(1)
+
+                # Тест 3: HTML fallback (если RSS тоже пуст)
+                if test_result["api"]["count"] == 0 and test_result["rss"]["count"] == 0:
                     try:
                         html_vacancies = await fetch_html_fallback(session, city_id, keyword)
                         test_result["html"]["count"] = len(html_vacancies)
@@ -1353,10 +1449,10 @@ async def test_search():
     results["elapsed_seconds"] = round(time.time() - start_time, 2)
     results["status"] = "completed"
 
-    if results["total_vacancies_found"] == 0 and not results["errors"]:
-        results["recommendation"] = "Все способы заблокированы. Нужен официальный API HH.ru (требуется токен)."
-    elif results["total_vacancies_found"] > 0:
-        results["recommendation"] = "Поиск работает! Прямые запросы проходят."
+    if results["total_vacancies_found"] > 0:
+        results["recommendation"] = "Поиск работает!"
+    elif not results["errors"]:
+        results["recommendation"] = "Все способы заблокированы. Нужен OAuth-токен HH.ru для API."
     else:
         results["recommendation"] = "Есть ошибки. Проверьте логи."
 
