@@ -40,7 +40,6 @@ MAX_VACANCIES_PER_CYCLE = 5
 DB_PATH = "vacancies.db"
 PROFILE_PATH = "profile.yaml"
 
-# Глобальный флаг для блокировки одновременных поисков
 search_in_progress = False
 
 # --- DeepSeek (опционально) ---
@@ -217,8 +216,6 @@ def score_vacancy(vacancy):
 
 # --- Функция для RSS (запасной вариант) ---
 async def fetch_hh_rss(city_id, keyword, per_page=10):
-    """Получает вакансии через RSS-ленту."""
-    # Убираем per_page, так как RSS всегда возвращает 10 последних
     url = f"https://hh.ru/rss/vacancy?text={keyword}&area={city_id}"
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -236,15 +233,12 @@ async def fetch_hh_rss(city_id, keyword, per_page=10):
                     title = item.find("title").text if item.find("title") is not None else ""
                     link = item.find("link").text if item.find("link") is not None else ""
                     description = item.find("description").text if item.find("description") is not None else ""
-                    # Извлекаем компанию из description
                     company = "Неизвестно"
                     if "Компания:" in description:
                         company = description.split("Компания:")[1].split("<")[0].strip()
-                    # Извлекаем город
                     city = ""
                     if "Город:" in description:
                         city = description.split("Город:")[1].split("<")[0].strip()
-                    # ID из ссылки
                     vid = link.split("/")[-1] if link else "0"
                     items.append({
                         "id": vid,
@@ -261,12 +255,11 @@ async def fetch_hh_rss(city_id, keyword, per_page=10):
             logger.error(f"RSS error: {e}")
             return []
 
-# --- Запрос к HH.ru API с полными заголовками и случайным User-Agent ---
+# --- Запрос к HH.ru API ---
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
 ]
 
 async def fetch_hh_api(city_id, keyword, per_page=15):
@@ -292,7 +285,7 @@ async def fetch_hh_api(city_id, keyword, per_page=15):
             async with session.get(url, params=params, headers=headers, timeout=15) as resp:
                 if resp.status == 403:
                     logger.warning("HH API вернул 403, пробуем RSS")
-                    return None  # сигнал, что API заблокирован
+                    return None
                 if resp.status != 200:
                     logger.warning(f"HH API status {resp.status} for {keyword}")
                     return []
@@ -327,7 +320,41 @@ async def fetch_hh_vacancies(city_id, keyword, per_page=15):
         return await fetch_hh_rss(city_id, keyword, per_page)
     return api_result if api_result is not None else []
 
-# --- Форматирование с ссылкой ---
+# --- Демонстрационные вакансии (для режима, если реальный поиск не работает) ---
+DEMO_VACANCIES = [
+    {
+        "id": "demo_1",
+        "url": "https://hh.ru/vacancy/123",
+        "name": "Коммерческий директор (нефтепродукты)",
+        "employer": {"name": "ООО НефтеТрейд"},
+        "area": {"name": "Волгоград"},
+        "salary": {"from": 200000, "to": 250000, "currency": "RUR"},
+        "snippet": {"requirement": "Опыт управления отделом продаж ГСМ от 5 лет", "responsibility": "Руководство отделом"},
+        "description": "Управление продажами нефтепродуктов, работа с НПЗ, логистика."
+    },
+    {
+        "id": "demo_2",
+        "url": "https://hh.ru/vacancy/456",
+        "name": "Директор по продажам (ГСМ)",
+        "employer": {"name": "ООО Топливный Альянс"},
+        "area": {"name": "Москва"},
+        "salary": {"from": 180000, "to": 220000, "currency": "RUR"},
+        "snippet": {"requirement": "Опыт руководства отделом продаж от 3 лет, знание рынка нефтепродуктов", "responsibility": "Развитие клиентской базы"},
+        "description": "Развитие направления оптовых продаж, контроль дебиторской задолженности."
+    },
+    {
+        "id": "demo_3",
+        "url": "https://hh.ru/vacancy/789",
+        "name": "Руководитель отдела продаж (B2B)",
+        "employer": {"name": "ООО НефтеСнаб"},
+        "area": {"name": "Казань"},
+        "salary": {"from": 150000, "to": 180000, "currency": "RUR"},
+        "snippet": {"requirement": "Опыт работы в оптовых продажах, управление командой", "responsibility": "Построение отдела продаж"},
+        "description": "Организация работы отдела продаж, поиск новых клиентов, работа с контрактами."
+    }
+]
+
+# --- Форматирование ---
 def format_vacancy(v, score, idx, total):
     sal = v.get("salary")
     sal_str = f"{sal.get('from','')} - {sal.get('to','')} {sal.get('currency','')}".strip() if sal else "не указана"
@@ -337,7 +364,6 @@ def format_vacancy(v, score, idx, total):
            f"• Зарплата: {score.salary_match}/10\n• Локация: {score.location_match}/10\n• Опыт: {score.experience_match}/10\n"
            f"• Навыки: {score.skills_match}/10\n\n💬 {score.reasoning}")
     vid = v.get("id")
-    # Клавиатура с кнопкой "Перейти"
     kb_buttons = [
         [InlineKeyboardButton("👍", callback_data=f"like:{vid}"),
          InlineKeyboardButton("👎", callback_data=f"dislike:{vid}"),
@@ -371,7 +397,6 @@ async def do_search(update, context, force=False):
     search_in_progress = True
     try:
         chat_id = update.effective_chat.id
-        # Берём первые 2 города и 2 ключевых слова для скорости
         cities = list(PROFILE["filters"]["cities"].items())[:2]
         keywords = PROFILE["filters"]["keywords"][:2]
 
@@ -384,14 +409,31 @@ async def do_search(update, context, force=False):
                     api_blocked = True
                     continue
                 all_vacancies.extend(vacs)
-                # Случайная задержка 3-5 секунд между запросами
                 await asyncio.sleep(random.uniform(3, 5))
 
-        if api_blocked and not all_vacancies:
-            await context.bot.send_message(chat_id, "⚠️ API HH.ru временно недоступен (403). Попробуйте позже или измените ключевые слова.")
-            return
+        # Если реальных вакансий нет, используем демо
+        if not all_vacancies:
+            logger.info("Реальных вакансий не найдено, показываем демо-вакансии")
+            # Помечаем демо-вакансии как "не просмотренные", чтобы они показывались
+            demo_list = []
+            for v in DEMO_VACANCIES:
+                if not force and is_seen(v["id"]):
+                    continue
+                demo_list.append(v)
+            if not demo_list:
+                # Если все демо уже просмотрены, берём все заново (сбрасываем флаг)
+                for v in DEMO_VACANCIES:
+                    # Удаляем из seen, чтобы показать снова
+                    conn = sqlite3.connect(DB_PATH)
+                    c = conn.cursor()
+                    c.execute("DELETE FROM seen_vacancies WHERE id=?", (v["id"],))
+                    conn.commit()
+                    conn.close()
+                demo_list = DEMO_VACANCIES
+            all_vacancies = demo_list
+            await context.bot.send_message(chat_id, "⚠️ Реальные вакансии не найдены (API и RSS заблокированы). Показываю демонстрационные вакансии для теста.")
 
-        # Удаляем дубликаты и уже просмотренные
+        # Удаляем дубликаты и уже просмотренные (если это не демо)
         seen_ids = set()
         unique = []
         for v in all_vacancies:
