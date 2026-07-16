@@ -557,6 +557,101 @@ async def ask_deepseek_scoring(vacancy: dict) -> Optional[VacancyScore]:
         deepseek_available = False
         return None
 
+
+
+# ========== SMART RECRUITER WITH LEARNING ==========
+class SmartRecruiter:
+    """Умный рекрутер с обучением на feedback пользователя."""
+
+    def __init__(self):
+        self.feedback_history = []
+        self.user_preferences = {
+            "liked_companies": [],
+            "disliked_companies": [],
+            "liked_titles": [],
+            "disliked_keywords": [],
+            "liked_industries": [],
+            "salary_importance": 0.15,
+            "location_importance": 0.10,
+            "industry_importance": 0.25,
+        }
+
+    def on_user_action(self, vacancy: dict, score: VacancyScore, action: str):
+        """Обработка действия пользователя для обучения."""
+        company = vacancy.get("employer", {}).get("name", "")
+        title = vacancy.get("name", "")
+        text = (title + " " + vacancy.get("description", "")).lower()
+
+        if action == "like":
+            self.user_preferences["liked_companies"].append(company)
+            self.user_preferences["liked_titles"].append(title)
+            self.user_preferences["industry_importance"] = min(0.4, self.user_preferences["industry_importance"] + 0.02)
+        elif action == "dislike":
+            self.user_preferences["disliked_companies"].append(company)
+            self.user_preferences["disliked_keywords"].extend(
+                [w for w in title.lower().split() if len(w) > 4]
+            )
+        elif action == "apply":
+            self.user_preferences["liked_companies"].append(company)
+            self.user_preferences["industry_importance"] = min(0.5, self.user_preferences["industry_importance"] + 0.05)
+
+        self.feedback_history.append({
+            "action": action, "company": company, "title": title, "score": score.total,
+            "timestamp": datetime.now().isoformat()
+        })
+
+    def adjust_score(self, vacancy: dict, base_score: VacancyScore) -> VacancyScore:
+        """Корректирует скор на основе истории."""
+        company = vacancy.get("employer", {}).get("name", "").lower()
+        title = vacancy.get("name", "").lower()
+        text = (title + " " + vacancy.get("description", "")).lower()
+
+        adjustment = 0
+        reasons = []
+
+        liked = [c.lower() for c in self.user_preferences["liked_companies"][-15:]]
+        if any(lc in company for lc in liked):
+            adjustment += 8; reasons.append("компания из понравившихся")
+
+        disliked = [c.lower() for c in self.user_preferences["disliked_companies"][-15:]]
+        if any(dc in company for dc in disliked):
+            adjustment -= 15; reasons.append("компания из непонравившихся")
+
+        for kw in self.user_preferences["disliked_keywords"][-20:]:
+            if len(kw) > 4 and kw in text:
+                adjustment -= 5; reasons.append(f"содержит '{kw}' из нежелательных")
+                break
+
+        new_total = min(100, max(0, base_score.total + adjustment))
+
+        if new_total >= 80: verdict = "STRONG_MATCH"
+        elif new_total >= PROFILE["scoring"]["min_score"]: verdict = "MATCH"
+        elif new_total >= 40: verdict = "WEAK_MATCH"
+        else: verdict = "SKIP"
+
+        reasoning = base_score.reasoning
+        if reasons: reasoning += " | Учёт предпочтений: " + "; ".join(reasons)
+
+        return VacancyScore(
+            total=round(new_total, 1), role_fit=base_score.role_fit,
+            industry_match=base_score.industry_match, salary_match=base_score.salary_match,
+            location_match=base_score.location_match, experience_match=base_score.experience_match,
+            skills_match=base_score.skills_match, verdict=verdict, reasoning=reasoning
+        )
+
+    def get_summary(self) -> str:
+        total = len(self.feedback_history)
+        likes = sum(1 for f in self.feedback_history if f["action"] == "like")
+        dislikes = sum(1 for f in self.feedback_history if f["action"] == "dislike")
+        applies = sum(1 for f in self.feedback_history if f["action"] == "apply")
+        msg = f"🧠 Обучение рекрутера:\n\nВсего оценок: {total}\n"
+        msg += f"  👍 Лайков: {likes}\n  👎 Дизлайков: {dislikes}\n  📝 Откликов: {applies}\n\n"
+        msg += f"Веса: индустрия={self.user_preferences['industry_importance']:.2f}, "
+        msg += f"зарплата={self.user_preferences['salary_importance']:.2f}"
+        return msg
+
+smart_recruiter = SmartRecruiter()
+
 # ========== COVER LETTER GENERATION ==========
 COVER_LETTER_PROMPT = """Ты — профессиональный карьерный консультант. Напиши сопроводительное письмо от имени кандидата для отклика на вакансию.
 
@@ -1283,6 +1378,157 @@ async def background_search(context: ContextTypes.DEFAULT_TYPE):
             except:
                 pass
 
+
+# ========== SMART RECRUITER CALLBACKS ==========
+async def handle_vacancy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка кнопок под вакансией."""
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    chat_id = update.effective_chat.id
+
+    if data == "next":
+        idx = context.chat_data.get("vac_idx", 0) + 1
+        queue = context.chat_data.get("vac_queue", [])
+        context.chat_data["vac_idx"] = idx
+        if idx < len(queue):
+            v, s = queue[idx]
+            msg, kb = format_vacancy_with_buttons(v, s, idx+1, len(queue))
+            await query.edit_message_text(msg, reply_markup=kb)
+        else:
+            await query.edit_message_text("✅ Все вакансии просмотрены!")
+        return
+
+    if ":" not in data: return
+    action, vid = data.split(":", 1)
+    queue = context.chat_data.get("vac_queue", [])
+    vacancy = score = None
+    for v, s in queue:
+        if v.get("id") == vid: vacancy, score = v, s; break
+    if not vacancy:
+        await query.edit_message_text("⚠️ Вакансия не найдена")
+        return
+
+    if action == "like":
+        smart_recruiter.on_user_action(vacancy, score, "like")
+        await query.edit_message_text(query.message.text + "\n\n✅ Отмечено: интересно", reply_markup=None)
+    elif action == "dislike":
+        smart_recruiter.on_user_action(vacancy, score, "dislike")
+        await query.edit_message_text(query.message.text + "\n\n❌ Отмечено: не подходит", reply_markup=None)
+    elif action == "apply":
+        smart_recruiter.on_user_action(vacancy, score, "apply")
+        cover = await generate_cover_letter(vacancy)
+        if cover: await context.bot.send_message(chat_id=chat_id, text=f"📝 Письмо:\n{cover}")
+        await query.edit_message_text(query.message.text + "\n\n📝 Отмечено для отклика", reply_markup=None)
+        await add_application(vid, vacancy.get("name",""), vacancy.get("employer",{}).get("name",""), score.total)
+    elif action == "cover":
+        cover = await generate_cover_letter(vacancy)
+        if cover: await context.bot.send_message(chat_id=chat_id, text=f"📝 Письмо:\n{cover}")
+        else: await query.answer("Не удалось сгенерировать")
+
+def format_vacancy_with_buttons(vacancy, score, idx=0, total=0):
+    msg = format_vacancy_message(vacancy, score)
+    if total: msg = f"📌 {idx}/{total}\n\n" + msg
+    vid = vacancy.get("id", "")
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("👍", callback_data=f"like:{vid}"), 
+         InlineKeyboardButton("👎", callback_data=f"dislike:{vid}"),
+         InlineKeyboardButton("📝", callback_data=f"apply:{vid}")],
+        [InlineKeyboardButton("💬 Письмо", callback_data=f"cover:{vid}"),
+         InlineKeyboardButton("➡️ Далее", callback_data="next")]
+    ])
+    return msg, kb
+
+async def smart_search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Умный поиск с обучением."""
+    chat_id = update.effective_chat.id
+    await update.message.reply_text("🧠 Умный рекрутер ищет...")
+    class JobProxy:
+        def __init__(self, cid): self.chat_id = cid
+    context.job = JobProxy(chat_id)
+    await smart_background_search(context)
+    context.job = None
+
+async def smart_background_search(context: ContextTypes.DEFAULT_TYPE):
+    """Умный поиск с обучением."""
+    global search_lock, last_search_time
+    now = asyncio.get_event_loop().time()
+    if now - last_search_time < SEARCH_COOLDOWN_SECONDS: return
+    if search_lock.locked(): return
+
+    async with search_lock:
+        last_search_time = asyncio.get_event_loop().time()
+        start = asyncio.get_event_loop().time()
+        chat_id = context.job.chat_id if (context.job and hasattr(context.job, "chat_id")) else (int(CHAT_ID) if CHAT_ID else None)
+        if not chat_id: return
+
+        try:
+            all_vacancies = []
+            async with aiohttp.ClientSession() as session:
+                for city_ru, city_id in list(PROFILE["filters"]["cities"].items())[:8]:  # Лимит городов
+                    if asyncio.get_event_loop().time() - start > MAX_SEARCH_TIME: break
+                    city_vacs = []
+                    for keyword in PROFILE["filters"]["keywords"][:3]:  # Лимит ключевых слов
+                        api_items = await fetch_hh_api(session, city_id, keyword, per_page=10)
+                        if api_items:
+                            for item in api_items: city_vacs.append(hh_api_item_to_vacancy(item))
+                        else:
+                            rss = await fetch_rss(session, city_id, keyword, per_page=10)
+                            if rss: city_vacs.extend(rss)
+                        await asyncio.sleep(2)
+                    all_vacancies.extend(city_vacs)
+                    await asyncio.sleep(2)
+
+            seen = set()
+            unique = [v for v in all_vacancies if not (v["id"] in seen or seen.add(v["id"]))]
+            new_vacs = [v for v in unique if not await is_vacancy_sent(v["id"]) and not await is_vacancy_seen(v["id"])]
+
+            if not new_vacs:
+                await context.bot.send_message(chat_id=chat_id, text="🔍 Новых вакансий не найдено.")
+                return
+
+            scored = []
+            for v in new_vacs:
+                if asyncio.get_event_loop().time() - start > MAX_SEARCH_TIME: break
+                h = score_vacancy_heuristic(v)
+                ai = await ask_deepseek_scoring(v) if (deepseek_available and h.total >= 20) else None
+                final = ai if ai else h
+                final = smart_recruiter.adjust_score(v, final)
+                scored.append((v, final))
+                await mark_vacancy_seen(v["id"], v.get("name",""), v.get("employer",{}).get("name",""), final.total, final.verdict)
+
+            scored.sort(key=lambda x: x[1].total, reverse=True)
+            matches = [(v,s) for v,s in scored if s.verdict != "SKIP"]
+            if not matches: matches = scored[:5]
+
+            context.chat_data["vac_queue"] = matches
+            context.chat_data["vac_idx"] = 0
+
+            to_show = matches[:MAX_PUSH_PER_CYCLE]
+            await context.bot.send_message(chat_id=chat_id, 
+                text=f"🎯 Найдено {len(matches)} вакансий. Оцените — рекрутер учится!")
+
+            for i, (v, s) in enumerate(to_show, 1):
+                cover = await generate_cover_letter(v) if s.total >= 75 else None
+                msg, kb = format_vacancy_with_buttons(v, s, i, len(to_show))
+                await context.bot.send_message(chat_id=chat_id, text=msg, reply_markup=kb)
+                await asyncio.sleep(1)
+
+            avg = sum(s.total for _,s in matches)/len(matches) if matches else 0
+            await log_search(len(unique), len(to_show), avg)
+
+        except Exception as e:
+            logger.error(f"Smart search error: {e}", exc_info=True)
+            await context.bot.send_message(chat_id=chat_id, text=f"⚠️ Ошибка: {str(e)[:300]}")
+
+async def learning_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(smart_recruiter.get_summary())
+
+async def reset_learning_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global smart_recruiter
+    smart_recruiter = SmartRecruiter()
+    await update.message.reply_text("🔄 Обучение сброшено!")
+
 # ========== TELEGRAM COMMANDS ==========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ds_status = "✅" if deepseek_available else "❌"
@@ -1682,6 +1928,10 @@ async def run_webhook():
     application.add_handler(CommandHandler("relocate", relocate))
     application.add_handler(CommandHandler("cleanup", cleanup_cmd))
     application.add_handler(CommandHandler("help", help_cmd))
+    application.add_handler(CommandHandler("smart", smart_search_cmd))
+    application.add_handler(CommandHandler("learning", learning_cmd))
+    application.add_handler(CommandHandler("resetlearning", reset_learning_cmd))
+    application.add_handler(CallbackQueryHandler(handle_vacancy_callback))
     application.add_error_handler(error_handler)
     await application.initialize()
     await application.start()
