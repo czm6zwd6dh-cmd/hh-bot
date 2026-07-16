@@ -784,6 +784,13 @@ class HHOAuthClient:
         try:
             conn = sqlite3.connect(DB_PATH)
             c = conn.cursor()
+            # Создать таблицу если не существует (миграция)
+            c.execute("""CREATE TABLE IF NOT EXISTS oauth_tokens (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                access_token TEXT,
+                refresh_token TEXT,
+                expires_at TIMESTAMP
+            )""")
             c.execute("SELECT access_token, refresh_token, expires_at FROM oauth_tokens WHERE id = 1")
             row = c.fetchone()
             conn.close()
