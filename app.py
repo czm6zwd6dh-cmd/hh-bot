@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import os
 import sqlite3
 import asyncio
@@ -1138,7 +1139,8 @@ async def handle_text_question(update: Update, context: ContextTypes.DEFAULT_TYP
     answer = await ask_rag_about_vacancy(vacancy, question)
     await update.message.reply_text("💡 Ответ:\n\n" + answer)
 
-# ========== NATURAL LANGUAGE ASSISTANT ==========
+# ========== NATURAL LANGUAGE ASSISTANT (с эвристическим fallback) ==========
+# Промпт для DeepSeek
 NL_ASSISTANT_PROMPT = """Ты — интеллектуальный ассистент бота для поиска работы.
 Пользователь пишет тебе на естественном языке. Ты должен:
 1. Понять намерение пользователя
@@ -1185,10 +1187,49 @@ NL_ASSISTANT_PROMPT = """Ты — интеллектуальный ассист�
 Верни СТРОГО JSON без markdown:
 {"action": "search", "value": null, "filters": {}, "message": "краткий ответ пользователю"}"""
 
+# Эвристический парсер (без AI) для базовых команд
+def heuristic_parse(text: str) -> dict:
+    text_lower = text.lower().strip()
+    # Поиск
+    if any(word in text_lower for word in ["поиск", "найди", "вакансии", "ищи", "найти работу"]):
+        return {"action": "search", "value": None, "message": "🔍 Ищу вакансии по вашему запросу"}
+    # Статистика
+    if any(word in text_lower for word in ["статистика", "стат", "сколько"]):
+        return {"action": "show_stats", "value": None, "message": "📊 Показываю статистику"}
+    # Профиль
+    if any(word in text_lower for word in ["профиль", "мои данные", "кто я"]):
+        return {"action": "show_profile", "value": None, "message": "👤 Ваш профиль"}
+    # Помощь
+    if any(word in text_lower for word in ["помощь", "help", "что умеешь", "команды"]):
+        return {"action": "help", "value": None, "message": "📖 Список команд"}
+    # Приветствие
+    if any(word in text_lower for word in ["привет", "здравствуй", "хай", "hello", "ку"]):
+        return {"action": "help", "value": None, "message": "👋 Привет! Я бот для поиска вакансий. Напиши /help для списка команд."}
+    # Обучение
+    if any(word in text_lower for word in ["обучение", "настройка", "умный"]):
+        return {"action": "show_learning", "value": None, "message": "🧠 Показываю настройки рекрутера"}
+    # Сброс обучения
+    if "сброс" in text_lower and "обуч" in text_lower:
+        return {"action": "reset_learning", "value": None, "message": "🔄 Обучение сброшено"}
+    # Зарплата
+    if "зарплат" in text_lower and ("от" in text_lower or "больше" in text_lower):
+        import re
+        nums = re.findall(r'\b\d{5,}\b', text)
+        if nums:
+            return {"action": "set_salary", "value": int(nums[0]), "message": f"Устанавливаю зарплату от {nums[0]}"}
+    # Добавить город
+    if "добавь" in text_lower and "город" in text_lower:
+        # можно вытащить название города, но для простоты оставим unknown
+        pass
+    return {"action": "unknown", "value": None, "message": "Не понял запрос. Попробуйте /help"}
+
 async def process_natural_language(text: str) -> dict:
     global deepseek_available, client
+
+    # Если AI недоступен – используем эвристику
     if not deepseek_available or not client:
-        return {"action": "unknown", "message": "AI временно недоступен. Используйте команды: /search, /smart, /profile, /help"}
+        logger.warning("DeepSeek недоступен, используем эвристический парсер")
+        return heuristic_parse(text)
 
     profile_text = yaml.dump(PROFILE, allow_unicode=True, sort_keys=False)[:2000]
     user_msg = "Сообщение пользователя: \"" + text + "\""
@@ -1205,24 +1246,28 @@ async def process_natural_language(text: str) -> dict:
             timeout=15.0
         )
         answer = response.choices[0].message.content.strip()
-        logger.info(f"Raw AI response: {answer}")  # ← Логируем ответ для отладки
+        logger.info(f"Raw AI response: {answer}")  # ← для отладки
+
+        # Очищаем от markdown
         answer = re.sub(r"```json\s*", "", answer)
         answer = re.sub(r"```\s*", "", answer)
         result = json.loads(answer)
-        # Проверяем, что result — словарь и содержит action
+
         if not isinstance(result, dict):
-            raise ValueError("Ответ AI не является словарём")
+            raise ValueError("Ответ не является словарём")
+
         if "action" not in result:
-            # Если action отсутствует, подставляем unknown
             result["action"] = "unknown"
             result["message"] = result.get("message", "Не удалось определить действие")
         return result
+
     except json.JSONDecodeError as e:
         logger.error(f"JSON decode error: {e}, ответ: {answer}")
-        return {"action": "unknown", "message": "Ошибка обработки ответа от AI. Попробуйте ещё раз."}
+        # Fallback на эвристику
+        return heuristic_parse(text)
     except Exception as e:
         logger.error(f"NL processing error: {e}")
-        return {"action": "unknown", "message": "Не удалось понять запрос. Попробуйте команду /help"}
+        return heuristic_parse(text)
 
 async def handle_natural_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
@@ -1237,13 +1282,13 @@ async def handle_natural_message(update: Update, context: ContextTypes.DEFAULT_T
     await update.message.reply_text("🤔 Думаю...")
     result = await process_natural_language(text)
 
-    # Безопасно получаем action, даже если ключа нет
     action = result.get("action", "unknown")
     value = result.get("value")
     message = result.get("message", "")
 
     logger.info(f"[NL] Распознано действие: {action}")
 
+    # Выполняем действие
     if action == "search":
         await update.message.reply_text(message or "🔍 Ищу вакансии...")
         await search_now(update, context)
