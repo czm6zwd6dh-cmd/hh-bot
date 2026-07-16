@@ -300,30 +300,6 @@ def _get_applications_sync(status=None):
     conn.close()
     return result
 
-
-def _save_oauth_tokens_sync(access_token, refresh_token, expires_at):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("DELETE FROM oauth_tokens")
-    c.execute("INSERT INTO oauth_tokens (id, access_token, refresh_token, expires_at) VALUES (?, ?, ?, ?)",
-              (1, access_token, refresh_token, expires_at))
-    conn.commit()
-    conn.close()
-
-def _load_oauth_tokens_sync():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT access_token, refresh_token, expires_at FROM oauth_tokens WHERE id = 1")
-    row = c.fetchone()
-    conn.close()
-    return row
-
-async def save_oauth_tokens(access_token, refresh_token, expires_at):
-    await asyncio.to_thread(_save_oauth_tokens_sync, access_token, refresh_token, expires_at)
-
-async def load_oauth_tokens():
-    return await asyncio.to_thread(_load_oauth_tokens_sync)
-
 def _cleanup_sync(days=30):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -849,8 +825,8 @@ async def fetch_hh_api(session, city_id, keyword, per_page=20, page=0):
 
     await hh_rate_limiter.wait()
     logger.info(f"[HH-API] Запрос: {keyword} в area={city_id}")
-        token_preview = hh_oauth.access_token[:20] + "..." if hh_oauth.access_token else "НЕТ"
-        logger.info(f"[HH-API] Токен: {token_preview}")
+    token_status = "ЕСТЬ" if hh_oauth.access_token else "НЕТ"
+    logger.info(f"[HH-API] Токен: {token_status}")
 
     try:
         timeout = aiohttp.ClientTimeout(total=30, connect=10)
@@ -1573,20 +1549,6 @@ async def oauth_refresh():
     success = await hh_oauth.refresh_access_token()
     return {"success": success, "has_token": hh_oauth.has_token()}
 
-@app.post("/oauth/manual")
-async def oauth_manual(request: Request):
-    """Ручной ввод токенов (если OAuth flow не работает)."""
-    data = await request.json()
-    access_token = data.get("access_token")
-    refresh_token = data.get("refresh_token")
-    if not access_token:
-        return {"error": "access_token обязателен"}
-    hh_oauth.access_token = access_token
-    hh_oauth.refresh_token = refresh_token
-    hh_oauth.token_expires_at = datetime.now() + timedelta(days=14)
-    await hh_oauth.save_tokens()
-    return {"success": True, "message": "Токены сохранены вручную"}
-
 @app.get("/oauth/debug")
 async def oauth_debug():
     """Отладка OAuth статуса."""
@@ -1596,7 +1558,6 @@ async def oauth_debug():
         "token_preview": hh_oauth.access_token[:20] + "..." if hh_oauth.access_token else None,
         "refresh_preview": hh_oauth.refresh_token[:20] + "..." if hh_oauth.refresh_token else None,
         "expires": hh_oauth.token_expires_at.isoformat() if hh_oauth.token_expires_at else None,
-        "headers_auth": "Bearer" in str(hh_oauth.get_headers()),
     }
 
 @app.post("/webhook")
