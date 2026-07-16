@@ -25,7 +25,6 @@ logger = logging.getLogger(__name__)
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 CHAT_ID = os.getenv("CHAT_ID")
-SCRAPERAPI_KEY = os.getenv("SCRAPERAPI_KEY")
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL")
 
 if not TELEGRAM_TOKEN:
@@ -1201,9 +1200,8 @@ async def background_search(context: ContextTypes.DEFAULT_TYPE):
 # ========== TELEGRAM COMMANDS ==========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ds_status = "✅" if deepseek_available else "❌"
-    scraper_status = "✅" if SCRAPERAPI_KEY else "❌"
     text = "👋 Привет! Я ищу вакансии коммерческого директора в нефтянке.\n\n"
-    text += f"🤖 DeepSeek: {ds_status}\n🌐 ScraperAPI: {scraper_status}\n📡 HH.ru (RSS + HTML)\n"
+    text += f"🤖 DeepSeek: {ds_status}\n📡 HH.ru (RSS + HTML)\n"
     text += "📊 Скоринг: 0-100 с разбивкой по 6 критериям\n"
     text += "📝 Генерация сопроводительных писем\n"
     text += "📋 Трекинг откликов (Kanban-style)\n\n"
