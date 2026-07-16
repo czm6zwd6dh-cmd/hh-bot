@@ -212,19 +212,21 @@ def score_vacancy(vacancy):
                         experience_match=round(experience,1), skills_match=round(skills,1),
                         verdict=verdict, reasoning=reason)
 
-# --- Запрос к HH.ru (улучшенный) ---
+# --- ЗАПРОС К HH.RU (С User-Agent) ---
 async def fetch_hh_vacancies(city_id, keyword, per_page=15):
-    """Ищет вакансии по городу и ключевому слову (по названию и описанию)."""
+    """Ищет вакансии с корректным User-Agent."""
     url = "https://api.hh.ru/vacancies"
     params = {
         "area": city_id,
         "text": keyword,
         "per_page": per_page,
-        # убираем search_field, чтобы искать везде
+    }
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
     }
     async with aiohttp.ClientSession() as session:
         try:
-            async with session.get(url, params=params, timeout=10) as resp:
+            async with session.get(url, params=params, headers=headers, timeout=15) as resp:
                 if resp.status != 200:
                     logger.warning(f"HH API status {resp.status} for {keyword} in {city_id}")
                     return []
@@ -279,17 +281,17 @@ async def search_command(update, context):
 
 async def do_search(update, context, force=False):
     chat_id = update.effective_chat.id
-    cities = list(PROFILE["filters"]["cities"].items())  # берём все города
-    keywords = PROFILE["filters"]["keywords"]  # все ключевые слова
+    cities = list(PROFILE["filters"]["cities"].items())
+    keywords = PROFILE["filters"]["keywords"]
 
     all_vacancies = []
     for city_name, city_id in cities:
         for kw in keywords:
             vacs = await fetch_hh_vacancies(city_id, kw, per_page=15)
             all_vacancies.extend(vacs)
-            await asyncio.sleep(0.3)  # небольшая пауза
+            await asyncio.sleep(1)  # пауза 1 секунда, чтобы не перегружать API
 
-    # Удаляем дубликаты по ID
+    # Удаляем дубликаты и уже просмотренные
     seen_ids = set()
     unique = []
     for v in all_vacancies:
@@ -309,7 +311,6 @@ async def do_search(update, context, force=False):
     # Скоринг
     scored = [(v, score_vacancy(v)) for v in unique]
     scored.sort(key=lambda x: x[1].total, reverse=True)
-    # Оставляем только MATCH/STRONG, если есть, иначе топ-5
     good = [(v,s) for v,s in scored if s.verdict in ("MATCH","STRONG_MATCH")]
     if not good:
         good = scored[:MAX_VACANCIES_PER_CYCLE]
@@ -368,7 +369,7 @@ async def stats_command(update, context):
 async def help_command(update, context):
     await update.message.reply_text("📖 Команды:\n/search – поиск\n/stats – статистика\n/help – помощь\n\nПросто пишите, я отвечу.")
 
-# --- Диалог через DeepSeek ---
+# --- DeepSeek диалог ---
 async def deepseek_chat(message: str) -> str:
     if not deepseek_available:
         return "Извините, я сейчас не могу ответить (нет подключения к ИИ). Попробуйте команду /help."
@@ -419,7 +420,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await help_command(update, context)
         return
 
-    # Диалог
     await update.message.reply_text("🤔 Думаю...")
     reply = await deepseek_chat(text)
     await update.message.reply_text(reply)
