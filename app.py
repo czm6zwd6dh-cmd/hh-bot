@@ -1452,6 +1452,23 @@ async def blacklist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_profile(PROFILE)
     await update.message.reply_text(f"✅ Компания '{company}' {action} чёрный список")
 
+
+async def set_token_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ручная установка HH OAuth токена."""
+    if not context.args:
+        await update.message.reply_text("Использование: /settoken ВАШ_ACCESS_TOKEN [ВАШ_REFRESH_TOKEN]")
+        return
+    access_token = context.args[0]
+    refresh_token = context.args[1] if len(context.args) > 1 else ""
+    hh_oauth.access_token = access_token
+    hh_oauth.refresh_token = refresh_token
+    hh_oauth.token_expires_at = datetime.now() + timedelta(days=14)
+    try:
+        await hh_oauth.save_tokens()
+        await update.message.reply_text(f"✅ Токен сохранён! Проверка: {hh_oauth.has_token()}")
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Ошибка сохранения: {str(e)[:200]}")
+
 async def relocate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cities = list(PROFILE["filters"]["cities"].keys())
     await update.message.reply_text(f"🌍 Города: {', '.join(cities)}")
@@ -1595,6 +1612,7 @@ async def run_webhook():
     application.add_handler(CommandHandler("filters", filters_cmd))
     application.add_handler(CommandHandler("salary", set_salary))
     application.add_handler(CommandHandler("blacklist", blacklist_cmd))
+    application.add_handler(CommandHandler("settoken", set_token_cmd))
     application.add_handler(CommandHandler("relocate", relocate))
     application.add_handler(CommandHandler("cleanup", cleanup_cmd))
     application.add_handler(CommandHandler("help", help_cmd))
