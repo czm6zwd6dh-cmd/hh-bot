@@ -53,7 +53,7 @@ DEFAULT_PROFILE = {
         "specialization": "Нефтепродукты, ГСМ, B2B, опт",
         "employment_type": "Полная занятость",
         "format": "Офис/производство",
-        "salary_min": 200000,
+        "salary_min": 150000,
         "experience_years": 20,
         "management_years": 11,
         "key_skills": [
@@ -70,9 +70,11 @@ DEFAULT_PROFILE = {
         ]
     },
     "filters": {
-        "salary_min": 200000,
-        "cities": {"Волгоград": "24", "Москва": "1", "Казань": "88", "Нижний Новгород": "66",
-                   "Уфа": "99", "Астана": "160", "Баку": "100", "Минск": "1002"},
+        "salary_min": 150000,
+        "cities": {"Волгоград": "24", "Москва": "1", "Санкт-Петербург": "2", "Казань": "88", "Нижний Новгород": "66",
+                   "Уфа": "99", "Самара": "78", "Ростов-на-Дону": "76", "Краснодар": "53", "Воронеж": "26",
+                   "Астана": "160", "Баку": "100", "Минск": "1002", "Ереван": "104", "Ташкент": "103",
+                   "Тюмень": "95", "Омск": "68", "Челябинск": "104", "Пермь": "72", "Саратов": "79"},
         "keywords": ["коммерческий директор", "руководитель отдела продаж", "директор по продажам",
                      "директор филиала", "руководитель направления"],
         "industry_keywords": ["нефтепродукты", "ГСМ", "топливо", "бензин", "дизель", "мазут",
@@ -94,9 +96,9 @@ DEFAULT_PROFILE = {
             "experience_match": 0.10,
             "skills_match": 0.10
         },
-        "min_score": 60,
+        "min_score": 35,
         "strict_requirements": {
-            "min_salary": 200000,
+            "min_salary": 150000,
             "required_industries": ["нефтепродукты", "ГСМ", "топливо", "нефть", "oil", "petroleum", "fuel"],
             "exclude_any": ["стажёр", "intern", "junior"]
         }
@@ -384,8 +386,42 @@ def calculate_salary_score(vacancy_salary: dict) -> float:
 
 def calculate_location_score(city: str) -> float:
     allowed_cities = list(PROFILE["filters"]["cities"].keys())
-    if any(c.lower() in city.lower() for c in allowed_cities):
-        return 10.0
+    city_lower = city.lower()
+    # Exact match
+    for c in allowed_cities:
+        if c.lower() in city_lower:
+            return 10.0
+    # Partial match for common variations
+    volgograd_variants = ["волгоград", "волжский", "камышин", "михайловка", "фролово", "урюпинск"]
+    moscow_variants = ["москва", "московская", "химки", "красногорск", "одинцово", "люберцы", "московский"]
+    petersburg_variants = ["петербург", "ленинград", "пушкин", "павловск", "гатчина", "кронштадт"]
+    kazan_variants = ["казань", "набережные челны", "нижнекамск", "альметьевск", "зеленодольск"]
+    nn_variants = ["нижний новгород", "нижний", "дзержинск", "арзамас", "кстово", "бор"]
+    ufa_variants = ["уфа", "стерлитамак", "салават", "нефтеюганск", "октябрьский"]
+    samara_variants = ["самара", "тольятти", "сызрань", "новокуйбышевск"]
+    rostov_variants = ["ростов", "таганрог", "шахты", "новочеркасск", "волгодонск"]
+    krasnodar_variants = ["краснодар", "сочи", "новороссийск", "анапа", "армавир", "геленджик"]
+    voronezh_variants = ["воронеж", "борисоглебск", "россошь", "павловск"]
+    tyumen_variants = ["тюмень", "тобольск", "ишим", "ялуторовск"]
+    omsk_variants = ["омск", "калачинск", "исилькуль", "тара"]
+    chelyabinsk_variants = ["челябинск", "магнитогорск", "златоуст", "миасс", "копейск"]
+    perm_variants = ["пермь", "березники", "соликамск", "лысьва", "кудымкар"]
+    saratov_variants = ["саратов", "энгельс", "балаково", "волжский", "балашов"]
+    astana_variants = ["астана", "нур-султан", "алматы", "караганда", "шымкент"]
+    minsk_variants = ["минск", "брест", "гомель", "гродно", "витебск", "могилев"]
+    baku_variants = ["баку", "ганжа", "сумгаит"]
+    yerevan_variants = ["ереван", "гюмри", "ванадзор"]
+    tashkent_variants = ["ташкент", "самарканд", "бухара", "фергана", "наманган"]
+
+    all_variants = (volgograd_variants + moscow_variants + petersburg_variants + kazan_variants + 
+                    nn_variants + ufa_variants + samara_variants + rostov_variants + 
+                    krasnodar_variants + voronezh_variants + tyumen_variants + omsk_variants +
+                    chelyabinsk_variants + perm_variants + saratov_variants + astana_variants +
+                    minsk_variants + baku_variants + yerevan_variants + tashkent_variants)
+
+    for v in all_variants:
+        if v in city_lower:
+            return 8.0  # Slightly lower for nearby cities
     return 0.0
 
 def calculate_experience_score(text: str) -> float:
