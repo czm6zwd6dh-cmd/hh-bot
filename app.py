@@ -704,25 +704,35 @@ class HHOAuthClient:
             "code": code,
             "redirect_uri": HH_REDIRECT_URI,
         }
-        async with aiohttp.ClientSession() as session:
-            async with session.post(self.TOKEN_URL, data=data) as resp:
-                result = await resp.json()
-                if resp.status == 200:
-                    self.access_token = result.get("access_token")
-                    self.refresh_token = result.get("refresh_token")
-                    expires_in = result.get("expires_in", 1209600)
-                    self.token_expires_at = datetime.now() + timedelta(seconds=expires_in)
-                    await self.save_tokens()
-                    logger.info("HH OAuth: получены новые токены")
-                    return {
-                        "success": True,
-                        "access_token": self.access_token,
-                        "refresh_token": self.refresh_token,
-                        "expires_in": expires_in,
-                    }
-                else:
-                    logger.error(f"HH OAuth: ошибка обмена code: {result}")
-                    return {"success": False, "error": result}
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(self.TOKEN_URL, data=data) as resp:
+                    result = await resp.json()
+                    logger.info(f"HH OAuth: ответ API status={resp.status}, keys={list(result.keys())}")
+                    if resp.status == 200:
+                        self.access_token = result.get("access_token")
+                        self.refresh_token = result.get("refresh_token")
+                        expires_in = result.get("expires_in", 1209600)
+                        self.token_expires_at = datetime.now() + timedelta(seconds=expires_in)
+                        logger.info(f"HH OAuth: токен получен, access={self.access_token[:15]}..." if self.access_token else "HH OAuth: токен пустой!")
+                        # Сохраняем синхронно, т.к. async может не успеть
+                        saved = self.save_tokens_sync()
+                        if saved:
+                            logger.info("HH OAuth: токены сохранены успешно")
+                        else:
+                            logger.error("HH OAuth: НЕ УДАЛОСЬ сохранить токены")
+                        return {
+                            "success": True,
+                            "access_token": self.access_token,
+                            "refresh_token": self.refresh_token,
+                            "expires_in": expires_in,
+                        }
+                    else:
+                        logger.error(f"HH OAuth: ошибка обмена code: {result}")
+                        return {"success": False, "error": result}
+        except Exception as e:
+            logger.error(f"HH OAuth: исключение при exchange_code: {e}")
+            return {"success": False, "error": str(e)}
 
     async def refresh_access_token(self) -> bool:
         """Обновить access token через refresh token."""
@@ -764,27 +774,38 @@ class HHOAuthClient:
             return await self.refresh_access_token()
         return True
 
-    async def save_tokens(self):
-        """Сохранить токены в SQLite БД (persistent на Render)."""
+    def save_tokens_sync(self):
+        """Синхронное сохранение токенов в БД."""
         try:
             conn = sqlite3.connect(DB_PATH)
             c = conn.cursor()
+            c.execute("""CREATE TABLE IF NOT EXISTS oauth_tokens (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                access_token TEXT,
+                refresh_token TEXT,
+                expires_at TIMESTAMP
+            )""")
             c.execute("DELETE FROM oauth_tokens")
             c.execute("INSERT INTO oauth_tokens (id, access_token, refresh_token, expires_at) VALUES (?, ?, ?, ?)",
                       (1, self.access_token, self.refresh_token,
                        self.token_expires_at.isoformat() if self.token_expires_at else None))
             conn.commit()
             conn.close()
-            logger.info("HH OAuth: токены сохранены в БД")
+            logger.info("HH OAuth: токены сохранены в БД (sync)")
+            return True
         except Exception as e:
-            logger.error(f"HH OAuth: ошибка сохранения токенов в БД: {e}")
+            logger.error(f"HH OAuth: ошибка сохранения токенов: {e}")
+            return False
+
+    async def save_tokens(self):
+        """Асинхронная обёртка для сохранения."""
+        return await asyncio.to_thread(self.save_tokens_sync)
 
     def load_tokens(self):
         """Загрузить токены из SQLite БД при старте."""
         try:
             conn = sqlite3.connect(DB_PATH)
             c = conn.cursor()
-            # Создать таблицу если не существует (миграция)
             c.execute("""CREATE TABLE IF NOT EXISTS oauth_tokens (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
                 access_token TEXT,
@@ -799,7 +820,7 @@ class HHOAuthClient:
                 self.refresh_token = row[1] or self.refresh_token
                 if row[2]:
                     self.token_expires_at = datetime.fromisoformat(row[2])
-                logger.info("HH OAuth: токены загружены из БД")
+                logger.info(f"HH OAuth: токены загружены из БД, access={self.access_token[:10]}..." if self.access_token else "HH OAuth: токены загружены но пустые")
             else:
                 logger.info("HH OAuth: токены в БД не найдены")
         except Exception as e:
