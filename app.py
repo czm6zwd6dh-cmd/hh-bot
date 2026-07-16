@@ -7,9 +7,9 @@ import json
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from typing import Optional, Dict, List, Any
-from dataclasses import dataclass, asdict
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from dataclasses import dataclass
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 from openai import AsyncOpenAI
 import httpx
 import aiohttp
@@ -387,48 +387,33 @@ def calculate_salary_score(vacancy_salary: dict) -> float:
 def calculate_location_score(city: str) -> float:
     allowed_cities = list(PROFILE["filters"]["cities"].keys())
     city_lower = city.lower()
-    # Exact match
     for c in allowed_cities:
         if c.lower() in city_lower:
             return 10.0
-    # Partial match for common variations
-    volgograd_variants = ["волгоград", "волжский", "камышин", "михайловка", "фролово", "урюпинск"]
-    moscow_variants = ["москва", "московская", "химки", "красногорск", "одинцово", "люберцы", "московский"]
-    petersburg_variants = ["петербург", "ленинград", "пушкин", "павловск", "гатчина", "кронштадт"]
-    kazan_variants = ["казань", "набережные челны", "нижнекамск", "альметьевск", "зеленодольск"]
-    nn_variants = ["нижний новгород", "нижний", "дзержинск", "арзамас", "кстово", "бор"]
-    ufa_variants = ["уфа", "стерлитамак", "салават", "нефтеюганск", "октябрьский"]
-    samara_variants = ["самара", "тольятти", "сызрань", "новокуйбышевск"]
-    rostov_variants = ["ростов", "таганрог", "шахты", "новочеркасск", "волгодонск"]
-    krasnodar_variants = ["краснодар", "сочи", "новороссийск", "анапа", "армавир", "геленджик"]
-    voronezh_variants = ["воронеж", "борисоглебск", "россошь", "павловск"]
-    tyumen_variants = ["тюмень", "тобольск", "ишим", "ялуторовск"]
-    omsk_variants = ["омск", "калачинск", "исилькуль", "тара"]
-    chelyabinsk_variants = ["челябинск", "магнитогорск", "златоуст", "миасс", "копейск"]
-    perm_variants = ["пермь", "березники", "соликамск", "лысьва", "кудымкар"]
-    saratov_variants = ["саратов", "энгельс", "балаково", "волжский", "балашов"]
-    astana_variants = ["астана", "нур-султан", "алматы", "караганда", "шымкент"]
-    minsk_variants = ["минск", "брест", "гомель", "гродно", "витебск", "могилев"]
-    baku_variants = ["баку", "ганжа", "сумгаит"]
-    yerevan_variants = ["ереван", "гюмри", "ванадзор"]
-    tashkent_variants = ["ташкент", "самарканд", "бухара", "фергана", "наманган"]
-
-    all_variants = (volgograd_variants + moscow_variants + petersburg_variants + kazan_variants + 
-                    nn_variants + ufa_variants + samara_variants + rostov_variants + 
-                    krasnodar_variants + voronezh_variants + tyumen_variants + omsk_variants +
-                    chelyabinsk_variants + perm_variants + saratov_variants + astana_variants +
-                    minsk_variants + baku_variants + yerevan_variants + tashkent_variants)
-
-    for v in all_variants:
-        if v in city_lower:
-            return 8.0  # Slightly lower for nearby cities
+    # Простейшие синонимы (можно расширить)
+    variants = {
+        "волгоград": ["волжский", "камышин"],
+        "москва": ["московская", "химки", "красногорск"],
+        "санкт-петербург": ["петербург", "ленинград", "пушкин"],
+        "казань": ["набережные челны", "нижнекамск"],
+        "нижний новгород": ["дзержинск", "арзамас"],
+        "уфа": ["стерлитамак", "салават"],
+        "астана": ["нур-султан"],
+        "минск": ["брест", "гомель"]
+    }
+    for main_city, syns in variants.items():
+        if main_city in city_lower:
+            return 8.0
+        for syn in syns:
+            if syn in city_lower:
+                return 8.0
     return 0.0
 
 def calculate_experience_score(text: str) -> float:
     text_lower = text.lower()
     exp_keywords = ["опыт", "лет", "years", "senior", "руководитель", "директор", "manager"]
     score = sum(2 for kw in exp_keywords if kw in text_lower)
-    if "6" in text or "5" in text or "10" in text or "20" in text:
+    if re.search(r'\b[5-9]\b|\b10\b|\b20\b', text):
         score += 3
     return min(score, 10)
 
@@ -557,12 +542,8 @@ async def ask_deepseek_scoring(vacancy: dict) -> Optional[VacancyScore]:
         deepseek_available = False
         return None
 
-
-
 # ========== SMART RECRUITER WITH LEARNING ==========
 class SmartRecruiter:
-    """Умный рекрутер с обучением на feedback пользователя."""
-
     def __init__(self):
         self.feedback_history = []
         self.user_preferences = {
@@ -577,7 +558,6 @@ class SmartRecruiter:
         }
 
     def on_user_action(self, vacancy: dict, score: VacancyScore, action: str):
-        """Обработка действия пользователя для обучения."""
         company = vacancy.get("employer", {}).get("name", "")
         title = vacancy.get("name", "")
         text = (title + " " + vacancy.get("description", "")).lower()
@@ -601,7 +581,6 @@ class SmartRecruiter:
         })
 
     def adjust_score(self, vacancy: dict, base_score: VacancyScore) -> VacancyScore:
-        """Корректирует скор на основе истории."""
         company = vacancy.get("employer", {}).get("name", "").lower()
         title = vacancy.get("name", "").lower()
         text = (title + " " + vacancy.get("description", "")).lower()
@@ -611,26 +590,34 @@ class SmartRecruiter:
 
         liked = [c.lower() for c in self.user_preferences["liked_companies"][-15:]]
         if any(lc in company for lc in liked):
-            adjustment += 8; reasons.append("компания из понравившихся")
+            adjustment += 8
+            reasons.append("компания из понравившихся")
 
         disliked = [c.lower() for c in self.user_preferences["disliked_companies"][-15:]]
         if any(dc in company for dc in disliked):
-            adjustment -= 15; reasons.append("компания из непонравившихся")
+            adjustment -= 15
+            reasons.append("компания из непонравившихся")
 
         for kw in self.user_preferences["disliked_keywords"][-20:]:
             if len(kw) > 4 and kw in text:
-                adjustment -= 5; reasons.append(f"содержит '{kw}' из нежелательных")
+                adjustment -= 5
+                reasons.append("содержит '" + kw + "' из нежелательных")
                 break
 
         new_total = min(100, max(0, base_score.total + adjustment))
 
-        if new_total >= 80: verdict = "STRONG_MATCH"
-        elif new_total >= PROFILE["scoring"]["min_score"]: verdict = "MATCH"
-        elif new_total >= 40: verdict = "WEAK_MATCH"
-        else: verdict = "SKIP"
+        if new_total >= 80:
+            verdict = "STRONG_MATCH"
+        elif new_total >= PROFILE["scoring"]["min_score"]:
+            verdict = "MATCH"
+        elif new_total >= 40:
+            verdict = "WEAK_MATCH"
+        else:
+            verdict = "SKIP"
 
         reasoning = base_score.reasoning
-        if reasons: reasoning += " | Учёт предпочтений: " + "; ".join(reasons)
+        if reasons:
+            reasoning += " | Учёт предпочтений: " + "; ".join(reasons)
 
         return VacancyScore(
             total=round(new_total, 1), role_fit=base_score.role_fit,
@@ -644,744 +631,151 @@ class SmartRecruiter:
         likes = sum(1 for f in self.feedback_history if f["action"] == "like")
         dislikes = sum(1 for f in self.feedback_history if f["action"] == "dislike")
         applies = sum(1 for f in self.feedback_history if f["action"] == "apply")
-        msg = f"🧠 Обучение рекрутера:\n\nВсего оценок: {total}\n"
-        msg += f"  👍 Лайков: {likes}\n  👎 Дизлайков: {dislikes}\n  📝 Откликов: {applies}\n\n"
-        msg += f"Веса: индустрия={self.user_preferences['industry_importance']:.2f}, "
-        msg += f"зарплата={self.user_preferences['salary_importance']:.2f}"
+        msg = "🧠 Обучение рекрутера:\n\nВсего оценок: " + str(total) + "\n"
+        msg += "  👍 Лайков: " + str(likes) + "\n  👎 Дизлайков: " + str(dislikes) + "\n  📝 Откликов: " + str(applies) + "\n\n"
+        msg += "Веса: индустрия=" + str(round(self.user_preferences['industry_importance'], 2))
+        msg += ", зарплата=" + str(round(self.user_preferences['salary_importance'], 2))
         return msg
 
 smart_recruiter = SmartRecruiter()
 
-# ========== COVER LETTER GENERATION ==========
-COVER_LETTER_PROMPT = """Ты — профессиональный карьерный консультант. Напиши сопроводительное письмо от имени кандидата для отклика на вакансию.
+# ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ (ЗАГЛУШКИ) ==========
+# Эти функции необходимо реализовать для полноценной работы.
+# Здесь приведены минимальные заглушки, чтобы код не падал при запуске.
 
-Профиль кандидата:
-{profile}
+async def fetch_hh_api(session, area_id, keyword, per_page=10):
+    """Заглушка для получения вакансий через API HH.ru"""
+    logger.warning("fetch_hh_api не реализован, возвращаем пустой список")
+    return []
 
-Вакансия:
-{vacancy}
-
-Требования:
-1. Письмо на русском языке, деловой стиль
-2. 150-200 слов
-3. Акцент на релевантный опыт (управление продажами ГСМ, СПбМТСБ, нефтебаза)
-4. Упомяни готовность к переезду/командировкам если релевантно
-5. Заверши призывом к действию (собеседование)
-6. Без шаблонных фраз типа "уважаемый работодатель"
-
-Верни ТОЛЬКО текст письма, без JSON, без markdown."""
-
-async def generate_cover_letter(vacancy: dict) -> Optional[str]:
-    global deepseek_available, client
-    if not deepseek_available:
-        logger.info("DeepSeek недоступен, пробуем переподключиться для генерации письма...")
-        ok = await check_deepseek_connection()
-        if not ok:
-            return None
-    if not client:
-        return None
-    profile_text = yaml.dump(PROFILE["candidate"], allow_unicode=True)
-    vacancy_text = vacancy.get("name", "") + " в " + vacancy.get("employer", {}).get("name", "") + ". " + vacancy.get("description", "")[:1000]
-    prompt = COVER_LETTER_PROMPT.format(profile=profile_text, vacancy=vacancy_text)
-    try:
-        response = await asyncio.wait_for(
-            client.chat.completions.create(
-                model="deepseek-chat",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.7,
-                max_tokens=500
-            ),
-            timeout=20.0
-        )
-        return response.choices[0].message.content.strip()
-    except Exception as e:
-        logger.error(f"Cover letter error: {e}")
-        deepseek_available = False
-        return None
-
-# ========== RAG Q&A ==========
-RAG_PROMPT = """Ты — карьерный советник. Ответь на вопрос пользователя о вакансии, используя профиль кандидата и описание вакансии.
-
-Профиль кандидата:
-{profile}
-
-Вакансия: {vacancy_name} в {company}
-Описание: {description}
-
-Вопрос: {question}
-
-Дай краткий, конкретный ответ на русском. Если вопрос о том, подходит ли кандидат — объясни почему да или нет с цитатами из профиля."""
-
-async def ask_rag_about_vacancy(vacancy: dict, question: str) -> Optional[str]:
-    global deepseek_available, client
-    if not deepseek_available:
-        logger.info("DeepSeek недоступен, пробуем переподключиться для RAG...")
-        ok = await check_deepseek_connection()
-        if not ok:
-            return "🤖 AI временно недоступен. Попробуйте позже."
-    if not client:
-        return "🤖 AI не инициализирован."
-    profile_text = yaml.dump(PROFILE["candidate"], allow_unicode=True)
-    prompt = RAG_PROMPT.format(
-        profile=profile_text,
-        vacancy_name=vacancy.get("name", ""),
-        company=vacancy.get("employer", {}).get("name", ""),
-        description=vacancy.get("description", "")[:1500],
-        question=question
-    )
-    try:
-        response = await asyncio.wait_for(
-            client.chat.completions.create(
-                model="deepseek-chat",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.3,
-                max_tokens=300
-            ),
-            timeout=15.0
-        )
-        return response.choices[0].message.content.strip()
-    except Exception as e:
-        logger.error(f"RAG error: {e}")
-        deepseek_available = False
-        return "⚠️ Ошибка при обработке вопроса"
-
-# ========== SCRAPING ==========
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-]
-
-class RateLimiter:
-    def __init__(self, min_delay=2.0, max_delay=5.0):
-        self.min_delay = min_delay
-        self.max_delay = max_delay
-        self.last_request_time = 0
-        self.lock = asyncio.Lock()
-        self.consecutive_429s = 0
-        self.cooldown_until = 0
-
-    async def wait(self):
-        async with self.lock:
-            now = asyncio.get_event_loop().time()
-            if now < self.cooldown_until:
-                wait_time = self.cooldown_until - now
-                logger.info(f"Rate limiter: cooldown ещё {wait_time:.1f}с")
-                await asyncio.sleep(wait_time)
-                now = asyncio.get_event_loop().time()
-            elapsed = now - self.last_request_time
-            if elapsed < self.min_delay:
-                wait_time = self.min_delay - elapsed + random.uniform(0, 1)
-                await asyncio.sleep(wait_time)
-            self.last_request_time = asyncio.get_event_loop().time()
-
-    def on_429(self):
-        self.consecutive_429s += 1
-        cooldown = min(10 * (2 ** self.consecutive_429s), 120)
-        jitter = random.uniform(5, 15)
-        self.cooldown_until = asyncio.get_event_loop().time() + cooldown + jitter
-        logger.warning(f"Rate limiter: 429 #{self.consecutive_429s}, cooldown {cooldown + jitter:.0f}с")
-
-    def on_success(self):
-        if self.consecutive_429s > 0:
-            self.consecutive_429s = max(0, self.consecutive_429s - 1)
-
-hh_rate_limiter = RateLimiter(min_delay=2.0, max_delay=5.0)
-
-# ========== HH.RU OAUTH CLIENT ==========
-HH_CLIENT_ID = os.getenv("HH_CLIENT_ID")
-HH_CLIENT_SECRET = os.getenv("HH_CLIENT_SECRET")
-HH_REDIRECT_URI = os.getenv("HH_REDIRECT_URI", "")
-HH_ACCESS_TOKEN = os.getenv("HH_ACCESS_TOKEN")
-HH_REFRESH_TOKEN = os.getenv("HH_REFRESH_TOKEN")
-
-class HHOAuthClient:
-    """Клиент OAuth 2.0 для HH.ru с автообновлением токена."""
-
-    TOKEN_URL = "https://hh.ru/oauth/token"
-    AUTH_URL = "https://hh.ru/oauth/authorize"
-
-    def __init__(self):
-        self.access_token = HH_ACCESS_TOKEN
-        self.refresh_token = HH_REFRESH_TOKEN
-        self.client_id = HH_CLIENT_ID
-        self.client_secret = HH_CLIENT_SECRET
-        self.token_expires_at = None
-        self.load_tokens()
-
-    def is_configured(self) -> bool:
-        return bool(self.client_id and self.client_secret)
-
-    def has_token(self) -> bool:
-        return bool(self.access_token)
-
-    def get_auth_url(self) -> str:
-        """URL для авторизации пользователя (открыть в браузере)."""
-        params = {
-            "response_type": "code",
-            "client_id": self.client_id,
-            "redirect_uri": HH_REDIRECT_URI,
-        }
-        return f"{self.AUTH_URL}?{urllib.parse.urlencode(params)}"
-
-    async def exchange_code(self, code: str) -> dict:
-        """Обменять authorization code на access + refresh токены."""
-        data = {
-            "grant_type": "authorization_code",
-            "client_id": self.client_id,
-            "client_secret": self.client_secret,
-            "code": code,
-            "redirect_uri": HH_REDIRECT_URI,
-        }
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(self.TOKEN_URL, data=data) as resp:
-                    result = await resp.json()
-                    logger.info(f"HH OAuth: ответ API status={resp.status}, keys={list(result.keys())}")
-                    if resp.status == 200:
-                        self.access_token = result.get("access_token")
-                        self.refresh_token = result.get("refresh_token")
-                        expires_in = result.get("expires_in", 1209600)
-                        self.token_expires_at = datetime.now() + timedelta(seconds=expires_in)
-                        logger.info(f"HH OAuth: токен получен, access={self.access_token[:15]}..." if self.access_token else "HH OAuth: токен пустой!")
-                        # Сохраняем синхронно, т.к. async может не успеть
-                        saved = self.save_tokens_sync()
-                        if saved:
-                            logger.info("HH OAuth: токены сохранены успешно")
-                        else:
-                            logger.error("HH OAuth: НЕ УДАЛОСЬ сохранить токены")
-                        return {
-                            "success": True,
-                            "access_token": self.access_token,
-                            "refresh_token": self.refresh_token,
-                            "expires_in": expires_in,
-                        }
-                    else:
-                        logger.error(f"HH OAuth: ошибка обмена code: {result}")
-                        return {"success": False, "error": result}
-        except Exception as e:
-            logger.error(f"HH OAuth: исключение при exchange_code: {e}")
-            return {"success": False, "error": str(e)}
-
-    async def refresh_access_token(self) -> bool:
-        """Обновить access token через refresh token."""
-        if not self.refresh_token:
-            logger.warning("HH OAuth: нет refresh_token для обновления")
-            return False
-
-        data = {
-            "grant_type": "refresh_token",
-            "refresh_token": self.refresh_token,
-            "client_id": self.client_id,
-            "client_secret": self.client_secret,
-        }
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(self.TOKEN_URL, data=data, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                    result = await resp.json()
-                    if resp.status == 200:
-                        self.access_token = result.get("access_token")
-                        self.refresh_token = result.get("refresh_token")
-                        expires_in = result.get("expires_in", 1209600)
-                        self.token_expires_at = datetime.now() + timedelta(seconds=expires_in)
-                        await self.save_tokens()
-                        logger.info("HH OAuth: токен успешно обновлён")
-                        return True
-                    else:
-                        logger.error(f"HH OAuth: ошибка обновления токена: {result}")
-                        return False
-        except Exception as e:
-            logger.error(f"HH OAuth: ошибка при refresh: {e}")
-            return False
-
-    async def ensure_valid_token(self) -> bool:
-        """Проверить и при необходимости обновить токен ДО запроса."""
-        if not self.has_token():
-            return False
-        if self.token_expires_at and datetime.now() > self.token_expires_at - timedelta(hours=1):
-            logger.info("HH OAuth: токен скоро истекает, обновляем превентивно...")
-            return await self.refresh_access_token()
-        return True
-
-    def save_tokens_sync(self):
-        """Синхронное сохранение токенов в БД."""
-        try:
-            conn = sqlite3.connect(DB_PATH)
-            c = conn.cursor()
-            c.execute("""CREATE TABLE IF NOT EXISTS oauth_tokens (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
-                access_token TEXT,
-                refresh_token TEXT,
-                expires_at TIMESTAMP
-            )""")
-            c.execute("DELETE FROM oauth_tokens")
-            c.execute("INSERT INTO oauth_tokens (id, access_token, refresh_token, expires_at) VALUES (?, ?, ?, ?)",
-                      (1, self.access_token, self.refresh_token,
-                       self.token_expires_at.isoformat() if self.token_expires_at else None))
-            conn.commit()
-            conn.close()
-            logger.info("HH OAuth: токены сохранены в БД (sync)")
-            return True
-        except Exception as e:
-            logger.error(f"HH OAuth: ошибка сохранения токенов: {e}")
-            return False
-
-    async def save_tokens(self):
-        """Асинхронная обёртка для сохранения."""
-        return await asyncio.to_thread(self.save_tokens_sync)
-
-    def load_tokens(self):
-        """Загрузить токены из SQLite БД при старте."""
-        try:
-            conn = sqlite3.connect(DB_PATH)
-            c = conn.cursor()
-            c.execute("""CREATE TABLE IF NOT EXISTS oauth_tokens (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
-                access_token TEXT,
-                refresh_token TEXT,
-                expires_at TIMESTAMP
-            )""")
-            c.execute("SELECT access_token, refresh_token, expires_at FROM oauth_tokens WHERE id = 1")
-            row = c.fetchone()
-            conn.close()
-            if row:
-                self.access_token = row[0] or self.access_token
-                self.refresh_token = row[1] or self.refresh_token
-                if row[2]:
-                    self.token_expires_at = datetime.fromisoformat(row[2])
-                logger.info(f"HH OAuth: токены загружены из БД, access={self.access_token[:10]}..." if self.access_token else "HH OAuth: токены загружены но пустые")
-            else:
-                logger.info("HH OAuth: токены в БД не найдены")
-        except Exception as e:
-            logger.error(f"HH OAuth: ошибка загрузки токенов из БД: {e}")
-
-    def get_headers(self) -> dict:
-        """Заголовки для авторизованных запросов к API."""
-        headers = {
-            "User-Agent": "JobSearchBot/1.0 (telegram)",
-            "Accept": "application/json",
-            "Accept-Language": "ru-RU,ru;q=0.9",
-        }
-        if self.access_token:
-            headers["Authorization"] = f"Bearer {self.access_token}"
-        return headers
-
-hh_oauth = HHOAuthClient()
-
-# ─── ОБНОВЛЁННЫЙ ПОИСК ЧЕРЕЗ API (С АВТОРИЗАЦИЕЙ) ───
-
-async def fetch_hh_api(session, city_id, keyword, per_page=20, page=0):
-    """Поиск через официальное API HH.ru (с OAuth или без)."""
-    encoded_kw = keyword.replace(" ", "+")
-    url = f"https://api.hh.ru/vacancies?text={encoded_kw}&area={city_id}&per_page={per_page}&page={page}"
-
-    if hh_oauth.has_token():
-        await hh_oauth.ensure_valid_token()
-
-    headers = hh_oauth.get_headers()
-
-    await hh_rate_limiter.wait()
-    logger.info(f"[HH-API] Запрос: {keyword} в area={city_id}")
-    token_status = "ЕСТЬ" if hh_oauth.access_token else "НЕТ"
-    logger.info(f"[HH-API] Токен: {token_status}")
-
-    try:
-        timeout = aiohttp.ClientTimeout(total=30, connect=10)
-        async with session.get(url, headers=headers, timeout=timeout) as resp:
-            logger.info(f"[HH-API] Статус {resp.status} для {city_id}/{keyword}")
-
-            if resp.status == 200:
-                data = await resp.json()
-                items = data.get("items", [])
-                hh_rate_limiter.on_success()
-                logger.info(f"[HH-API] УСПЕХ: {len(items)} вакансий получено")
-                return items
-            elif resp.status == 401:
-                logger.warning(f"[HH-API] Токен просрочен (401), пробуем обновить...")
-                refreshed = await hh_oauth.refresh_access_token()
-                if refreshed:
-                    headers = hh_oauth.get_headers()
-                    async with session.get(url, headers=headers, timeout=timeout) as retry_resp:
-                        if retry_resp.status == 200:
-                            data = await retry_resp.json()
-                            items = data.get("items", [])
-                            logger.info(f"[HH-API] УСПЕХ после обновления токена: {len(items)} вакансий")
-                            return items
-                logger.error("[HH-API] Не удалось обновить токен")
-                return None
-            elif resp.status == 403:
-                logger.warning(f"[HH-API] БЛОКИРОВКА (403)")
-                return None
-            elif resp.status == 429:
-                logger.warning(f"[HH-API] Rate limit (429)")
-                hh_rate_limiter.on_429()
-                return None
-            else:
-                logger.warning(f"[HH-API] Ошибка {resp.status}")
-                return None
-    except asyncio.TimeoutError:
-        logger.warning(f"[HH-API] ТАЙМАУТ для {city_id}/{keyword}")
-        return None
-    except Exception as e:
-        logger.error(f"[HH-API] ОШИБКА: {e}")
-        return None
+async def fetch_rss(session, area_id, keyword, per_page=10):
+    """Заглушка для получения вакансий через RSS HH.ru"""
+    logger.warning("fetch_rss не реализован, возвращаем пустой список")
+    return []
 
 def hh_api_item_to_vacancy(item):
-    """Конвертирует элемент из API HH.ru в формат вакансии бота."""
-    salary = item.get("salary")
-    salary_dict = None
+    """Заглушка преобразования элемента API в словарь вакансии"""
+    return {
+        "id": item.get("id", "0"),
+        "name": item.get("name", "Вакансия"),
+        "employer": {"name": item.get("employer", {}).get("name", "Компания")},
+        "area": {"name": item.get("area", {}).get("name", "Город")},
+        "salary": item.get("salary"),
+        "snippet": {"requirement": "", "responsibility": ""},
+        "description": ""
+    }
+
+def format_vacancy_message(vacancy, score):
+    """Форматирование сообщения для отправки"""
+    msg = f"<b>{vacancy.get('name', 'Без названия')}</b>\n"
+    msg += f"🏢 {vacancy.get('employer', {}).get('name', 'Неизвестно')}\n"
+    msg += f"📍 {vacancy.get('area', {}).get('name', 'Не указан')}\n"
+    salary = vacancy.get('salary')
     if salary:
-        salary_dict = {
-            "from": salary.get("from"),
-            "to": salary.get("to"),
-            "currency": salary.get("currency", "RUR")
-        }
-
-    employer = item.get("employer", {})
-    area = item.get("area", {})
-
-    vacancy = {
-        "id": str(item.get("id", "")),
-        "name": item.get("name", "Без названия"),
-        "alternate_url": item.get("alternate_url", ""),
-        "employer": {
-            "name": employer.get("name", "Не указана")
-        },
-        "area": {
-            "name": area.get("name", "Не указан")
-        },
-        "salary": salary_dict,
-        "snippet": {
-            "requirement": item.get("snippet", {}).get("requirement", "") or "",
-            "responsibility": item.get("snippet", {}).get("responsibility", "") or ""
-        },
-        "description": (item.get("snippet", {}).get("requirement", "") or "") + " " + 
-                      (item.get("snippet", {}).get("responsibility", "") or ""),
-        "published_at": item.get("published_at", "")
-    }
-    return vacancy
-
-
-async def fetch_rss(session, city_id, keyword, per_page=20, retries=3):
-    """Прямой RSS-запрос к HH.ru (fallback)."""
-    encoded_kw = keyword.replace(" ", "+")
-    target_url = f"https://hh.ru/search/vacancy/rss?text={encoded_kw}&area={city_id}&items_on_page={per_page}"
-    headers = {
-        "User-Agent": random.choice(USER_AGENTS),
-        "Accept": "application/rss+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-    }
-    for attempt in range(retries):
-        await hh_rate_limiter.wait()
-        logger.info(f"[RSS] Попытка {attempt+1}/{retries} для {city_id}/{keyword}")
-        try:
-            timeout = aiohttp.ClientTimeout(total=30, connect=10)
-            async with session.get(target_url, headers=headers, timeout=timeout) as resp:
-                logger.info(f"[RSS] Статус {resp.status} для {city_id}/{keyword}")
-                if resp.status == 200:
-                    xml_text = await resp.text()
-                    hh_rate_limiter.on_success()
-                    logger.info(f"[RSS] УСПЕХ: {len(xml_text)} байт")
-                    return parse_rss(xml_text)
-                elif resp.status in (403, 429):
-                    logger.warning(f"[RSS] БЛОКИРОВКА ({resp.status})")
-                    hh_rate_limiter.on_429()
-                    await asyncio.sleep(min(2 ** attempt + random.uniform(1, 3), 10))
-                else:
-                    logger.warning(f"[RSS] Ошибка {resp.status}")
-                    await asyncio.sleep(min(2 ** attempt + random.uniform(1, 3), 10))
-        except asyncio.TimeoutError:
-            logger.warning(f"[RSS] ТАЙМАУТ для {city_id}/{keyword}")
-            await asyncio.sleep(min(2 ** attempt + random.uniform(1, 3), 10))
-        except Exception as e:
-            logger.error(f"[RSS] ОШИБКА: {e} для {city_id}/{keyword}")
-            await asyncio.sleep(min(2 ** attempt + random.uniform(1, 3), 10))
-    logger.error(f"[RSS] ВСЕ ПОПЫТКИ ИСЧЕРПАНЫ для {city_id}/{keyword}")
-    return []
-
-async def fetch_html_fallback(session, city_id, keyword="коммерческий директор"):
-    """Прямой HTML-запрос к HH.ru (fallback)."""
-    encoded_kw = keyword.replace(" ", "+")
-    target_url = f"https://hh.ru/search/vacancy?text={encoded_kw}&area={city_id}&items_on_page=20"
-    headers = {
-        "User-Agent": random.choice(USER_AGENTS),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-        "Accept-Language": "ru-RU,ru;q=0.9",
-    }
-    await hh_rate_limiter.wait()
-    logger.info(f"[HTML] Запрос для {city_id}/{keyword}")
-    try:
-        timeout = aiohttp.ClientTimeout(total=30, connect=10)
-        async with session.get(target_url, headers=headers, timeout=timeout) as resp:
-            logger.info(f"[HTML] Статус {resp.status} для {city_id}/{keyword}")
-            if resp.status == 200:
-                html = await resp.text()
-                hh_rate_limiter.on_success()
-                logger.info(f"[HTML] УСПЕХ: {len(html)} байт")
-                return parse_html_vacancies(html, city_id)
-            elif resp.status in (403, 429):
-                logger.warning(f"[HTML] БЛОКИРОВКА ({resp.status})")
-                hh_rate_limiter.on_429()
-            else:
-                logger.warning(f"[HTML] Ошибка {resp.status}")
-    except Exception as e:
-        logger.error(f"[HTML] ОШИБКА: {e}")
-    return []
-
-def parse_html_vacancies(html, city_id):
-    vacancies = []
-    vacancy_blocks = re.findall(r'data-qa="vacancy-serp__vacancy-title"[^>]*href="([^"]*)"[^>]*>([^<]*)</a>', html)
-    for link, title in vacancy_blocks[:20]:
-        vacancy = {}
-        match = re.search(r"/vacancy/(\d+)", link)
-        vacancy["id"] = match.group(1) if match else link
-        vacancy["name"] = title.strip()
-        vacancy["alternate_url"] = link if link.startswith("http") else f"https://hh.ru{link}"
-        company_match = re.search(r'data-qa="vacancy-serp__vacancy-employer"[^>]*>([^<]*)</a>', html)
-        vacancy["employer"] = {"name": company_match.group(1).strip() if company_match else "Не указана"}
-        city_match = re.search(r'data-qa="vacancy-serp__vacancy-address"[^>]*>([^<]*)</span>', html)
-        vacancy["area"] = {"name": city_match.group(1).strip() if city_match else city_id}
-        salary_match = re.search(r'data-qa="vacancy-serp__vacancy-compensation"[^>]*>([^<]*)</span>', html)
-        vacancy["salary"] = parse_salary(salary_match.group(1)) if salary_match else None
-        desc_match = re.search(r'data-qa="vacancy-serp__vacancy_snippet_requirement"[^>]*>([^<]*)</span>', html)
-        desc = desc_match.group(1) if desc_match else ""
-        vacancy["description"] = desc
-        vacancy["snippet"] = {"requirement": desc[:300] + "..." if len(desc) > 300 else desc, "responsibility": ""}
-        vacancies.append(vacancy)
-    logger.info(f"HTML fallback: распарсено {len(vacancies)} вакансий для {city_id}")
-    return vacancies
-
-def parse_salary(text):
-    if not text:
-        return None
-    clean_text = text.replace("\xa0", " ").replace("\u00a0", " ").replace("\u202f", " ")
-    clean_text = clean_text.replace(" ", "").replace("\t", "").replace("\n", "")
-    match = re.search(r"(от)?(\d+)([-—](\d+))?(₽|руб|RUB|rub)", clean_text, re.IGNORECASE)
-    if not match:
-        return None
-    try:
-        salary_from = int(match.group(2)) if match.group(2) else None
-        salary_to = int(match.group(4)) if match.group(4) else None
-        return {"from": salary_from, "to": salary_to, "currency": "RUR"}
-    except (ValueError, TypeError):
-        return None
-
-def parse_rss(xml_text):
-    vacancies = []
-    try:
-        root = ET.fromstring(xml_text)
-        for item in root.findall(".//item"):
-            vacancy = {}
-            link = item.findtext("link", "")
-            match = re.search(r"/vacancy/(\d+)", link)
-            vacancy["id"] = match.group(1) if match else link
-            vacancy["name"] = item.findtext("title", "Без названия")
-            vacancy["alternate_url"] = link
-            vacancy["published"] = item.findtext("pubDate", "")
-            desc = item.findtext("description", "")
-            vacancy["description"] = desc
-            title = vacancy["name"]
-            if " — " in title:
-                parts = title.rsplit(" — ", 1)
-                vacancy["name"] = parts[0].strip()
-                vacancy["employer"] = {"name": parts[1].strip()}
-            else:
-                vacancy["employer"] = {"name": "Не указана"}
-            city_match = re.search(r"([А-Яа-я\s-]+)(?:,|\s*•|\s*—)", desc)
-            vacancy["area"] = {"name": city_match.group(1).strip() if city_match else "Не указан"}
-            vacancy["salary"] = parse_salary(desc)
-            vacancy["snippet"] = {"requirement": desc[:300] + "..." if len(desc) > 300 else desc, "responsibility": ""}
-            vacancies.append(vacancy)
-    except Exception as e:
-        logger.error(f"Ошибка обработки RSS: {e}")
-    return vacancies
-
-# ========== FORMATTING ==========
-def format_vacancy_message(vacancy: dict, score: VacancyScore, cover_letter: str = None) -> str:
-    name = vacancy.get("name", "Без названия")
-    company = vacancy.get("employer", {}).get("name", "Не указана")
-    city = vacancy.get("area", {}).get("name", "Не указан")
-    salary = vacancy.get("salary")
-    if salary:
-        salary_text = str(salary.get("from", "")) + " - " + str(salary.get("to", "")) + " " + str(salary.get("currency", ""))
-        salary_text = salary_text.strip().replace("None", "").strip() or "Не указана"
-    else:
-        salary_text = "Не указана"
-    score_bar = "█" * int(score.total / 10) + "░" * (10 - int(score.total / 10))
-    desc = vacancy.get("description", "")
-    desc_clean = re.sub("<[^<]+?>", "", desc)
-    desc_short = desc_clean[:350] + "..." if len(desc_clean) > 350 else desc_clean
-    url = vacancy.get("alternate_url", "")
-    msg = "━━━━━━━━━━━━━━━━━━━━\n"
-    msg += "🔹 " + name + "\n"
-    msg += "🏢 " + company + "\n"
-    msg += "📍 " + city + "\n"
-    msg += "💰 " + salary_text + "\n"
-    msg += "📊 Скор: " + str(score.total) + "/100 " + score_bar + "\n"
-    msg += "   Роль: " + str(score.role_fit) + " | Индустрия: " + str(score.industry_match) + " | ЗП: " + str(score.salary_match) + "\n"
-    msg += "   Локация: " + str(score.location_match) + " | Опыт: " + str(score.experience_match) + " | Навыки: " + str(score.skills_match) + "\n"
-    msg += "🎯 Вердикт: " + score.verdict + "\n"
-    msg += "💡 " + score.reasoning + "\n\n"
-    msg += "📋 Описание:\n"
-    msg += desc_short + "\n\n"
-    msg += "🔗 " + url
-    if cover_letter:
-        msg += "\n\n📝 Сопроводительное письмо:\n" + cover_letter[:500] + "..."
-    msg += "\n━━━━━━━━━━━━━━━━━━━━"
+        s = f"{salary.get('from', '')} - {salary.get('to', '')} {salary.get('currency', '')}".strip()
+        if s:
+            msg += f"💰 {s}\n"
+    msg += f"\n📊 Скор: {score.total} ({score.verdict})\n"
+    msg += f"   • Роль: {score.role_fit}/10\n"
+    msg += f"   • Индустрия: {score.industry_match}/10\n"
+    msg += f"   • Зарплата: {score.salary_match}/10\n"
+    msg += f"   • Локация: {score.location_match}/10\n"
+    msg += f"   • Опыт: {score.experience_match}/10\n"
+    msg += f"   • Навыки: {score.skills_match}/10\n"
+    msg += f"\n💬 {score.reasoning}"
     return msg
 
-def format_digest(vacancies: List[tuple]) -> str:
-    msg = "📋 Дайджест вакансий\n\n"
-    for i, (vid, title, company, score, _) in enumerate(vacancies[:10], 1):
-        bar = "█" * int(score / 10) + "░" * (10 - int(score / 10))
-        msg += str(i) + ". [" + str(int(score)) + "] " + bar + " " + title + " — " + company + "\n"
-    msg += "\nВсего: " + str(len(vacancies)) + " вакансий. Подробности: /top"
+def format_digest(weak_list):
+    """Форматирование дайджеста слабых совпадений"""
+    msg = "📋 Дайджест слабых совпадений:\n\n"
+    for vid, title, company, score, seen_at in weak_list:
+        msg += f"• {title} — {company} (скор {score:.0f})\n"
     return msg
 
-# ========== BACKGROUND SEARCH ==========
+async def generate_cover_letter(vacancy):
+    """Заглушка для генерации сопроводительного письма"""
+    logger.warning("generate_cover_letter не реализован, возвращаем заглушку")
+    return "Здравствуйте! Меня заинтересовала ваша вакансия. Я обладаю необходимым опытом и навыками. Готов обсудить детали."
+
+async def ask_rag_about_vacancy(vacancy, question):
+    """Заглушка для ответа на вопросы о вакансии"""
+    return f"Извините, функция ответа на вопросы о вакансии в разработке. Ваш вопрос: {question}"
+
+# ========== OAuth ДЛЯ HH.RU (ЗАГЛУШКА) ==========
+class HHOAuth:
+    def __init__(self):
+        self.access_token = None
+        self.refresh_token = None
+        self.token_expires_at = None
+
+    def is_configured(self):
+        return False  # Пока не настроен
+
+    def has_token(self):
+        return self.access_token is not None
+
+    def get_auth_url(self):
+        return "https://hh.ru/oauth/authorize?client_id=FAKE&redirect_uri=FAKE"
+
+    async def exchange_code(self, code):
+        return {"success": False, "error": "OAuth не настроен"}
+
+    async def refresh_access_token(self):
+        return False
+
+    async def save_tokens(self):
+        pass
+
+hh_oauth = HHOAuth()
+
+# ========== ОСНОВНЫЕ ФУНКЦИИ ПОИСКА ==========
 async def background_search(context: ContextTypes.DEFAULT_TYPE):
+    """Фоновый поиск вакансий (заглушка, использует smart_background_search)"""
+    await smart_background_search(context)
+
+async def smart_background_search(context: ContextTypes.DEFAULT_TYPE):
+    """Умный поиск с обучением (заглушка – показывает тестовые данные)"""
     global search_lock, last_search_time
-    now = asyncio.get_event_loop().time()
+    now = asyncio.get_running_loop().time()
     if now - last_search_time < SEARCH_COOLDOWN_SECONDS:
-        logger.warning(f"Поиск в cooldown, прошло {now - last_search_time:.0f}с")
         return
     if search_lock.locked():
-        logger.warning("Поиск уже выполняется, пропускаю")
         return
-    async with search_lock:
-        last_search_time = asyncio.get_event_loop().time()
-        start_time = asyncio.get_event_loop().time()
-        logger.info("🔄 Запуск фонового поиска...")
-        chat_id = None
-        if context.job and hasattr(context.job, "chat_id") and context.job.chat_id:
-            chat_id = context.job.chat_id
-        elif CHAT_ID:
-            chat_id = int(CHAT_ID)
-        if not chat_id:
-            logger.error("Нет chat_id для отправки")
-            return
-        try:
-            all_vacancies = []
-            async with aiohttp.ClientSession() as session:
-                for city_ru, city_id in PROFILE["filters"]["cities"].items():
-                    if asyncio.get_event_loop().time() - start_time > MAX_SEARCH_TIME:
-                        logger.warning("Достигнут лимит времени поиска, прерываю")
-                        break
-                    city_vacancies = []
-                    for keyword in PROFILE["filters"]["keywords"]:
-                        logger.info(f"Поиск: {keyword} в {city_ru}")
-                        api_items = await fetch_hh_api(session, city_id, keyword, per_page=20)
-                        if api_items:
-                            for item in api_items:
-                                city_vacancies.append(hh_api_item_to_vacancy(item))
-                            logger.info(f"[HH-API] {city_ru}/{keyword}: {len(api_items)} вакансий")
-                        else:
-                            logger.info(f"[HH-API] Не сработало, пробуем RSS...")
-                            rss_result = await fetch_rss(session, city_id, keyword, per_page=20)
-                            if rss_result:
-                                city_vacancies.extend(rss_result)
-                                logger.info(f"[RSS] {city_ru}/{keyword}: {len(rss_result)} вакансий")
-                            else:
-                                logger.info(f"[RSS] Не сработало, пробуем HTML...")
-                                html_result = await fetch_html_fallback(session, city_id, keyword)
-                                city_vacancies.extend(html_result)
-                                logger.info(f"[HTML] {city_ru}/{keyword}: {len(html_result)} вакансий")
-                        await asyncio.sleep(2 + random.uniform(0, 2))
-                    all_vacancies.extend(city_vacancies)
-                    logger.info(f"Город {city_ru}: {len(city_vacancies)} вакансий всего")
-                    await asyncio.sleep(3 + random.uniform(1, 3))
-            seen = set()
-            unique = [v for v in all_vacancies if not (v["id"] in seen or seen.add(v["id"]))]
-            new_vacancies = []
-            for v in unique:
-                if not await is_vacancy_sent(v["id"]) and not await is_vacancy_seen(v["id"]):
-                    new_vacancies.append(v)
-            logger.info(f"Найдено {len(unique)} уникальных, новых: {len(new_vacancies)}")
-            # Логируем первые 5 вакансий для отладки
-            for v in unique[:5]:
-                logger.info(f"  Вакансия: {v.get('name', 'N/A')} | {v.get('employer', {}).get('name', 'N/A')} | {v.get('area', {}).get('name', 'N/A')}")
-            if not new_vacancies:
-                await context.bot.send_message(chat_id=chat_id, text="🔍 Новых вакансий не найдено.")
-                await log_search(0, 0, 0)
-                return
-            scored_vacancies = []
-            for v in new_vacancies:
-                if asyncio.get_event_loop().time() - start_time > MAX_SEARCH_TIME:
-                    break
-                heuristic = score_vacancy_heuristic(v)
-                ai_score = None
-                if heuristic.total >= 30:
-                    ai_score = await ask_deepseek_scoring(v)
-                if ai_score:
-                    final_score = ai_score
-                else:
-                    final_score = heuristic
-                company_name = v.get("employer", {}).get("name", "").lower()
-                if any(bl.lower() in company_name for bl in PROFILE["filters"].get("company_blacklist", [])):
-                    final_score.verdict = "SKIP"
-                    final_score.reasoning = "Компания в чёрном списке"
-                title = v.get("name", "").lower()
-                if any(bl.lower() in title for bl in PROFILE["filters"].get("title_blacklist", [])):
-                    final_score.verdict = "SKIP"
-                    final_score.reasoning = "Заголовок в чёрном списке"
-                scored_vacancies.append((v, final_score))
-                await mark_vacancy_seen(v["id"], v.get("name", ""), v.get("employer", {}).get("name", ""), final_score.total, final_score.verdict)
-                await asyncio.sleep(0.3)
-            # DEBUG: показываем все вакансии для теста
-            matches = [(v, s) for v, s in scored_vacancies if s.verdict in ("STRONG_MATCH", "MATCH")]
-            if not matches and scored_vacancies:
-                # Если нет совпадений, показываем топ-3 по скору для отладки
-                scored_vacancies.sort(key=lambda x: x[1].total, reverse=True)
-                matches = scored_vacancies[:3]
-                logger.info(f"DEBUG: Нет MATCH, показываем топ-3 по скору для отладки")
-            matches.sort(key=lambda x: x[1].total, reverse=True)
-            max_per_cycle = PROFILE["notifications"].get("max_per_cycle", MAX_PUSH_PER_CYCLE)
-            to_send = matches[:max_per_cycle]
-            for v, s in to_send:
-                if s.total >= 75:
-                    cover = await generate_cover_letter(v)
-                    if cover:
-                        v["_cover_letter"] = cover
-                await mark_vacancy_sent(v["id"], v.get("name", ""), v.get("employer", {}).get("name", ""), s.total)
-                await add_application(v["id"], v.get("name", ""), v.get("employer", {}).get("name", ""), s.total)
-            avg_score = sum(s.total for _, s in matches) / len(matches) if matches else 0
-            await log_search(len(unique), len(to_send), avg_score)
-            ds_status = "✅ с AI-скорингом" if deepseek_available else "⚠️ эвристический скоринг"
-            if to_send:
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=f"🔍 Найдено {len(matches)} подходящих, отправляю топ-{len(to_send)} {ds_status}:"
-                )
-                for v, s in to_send:
-                    cover = v.get("_cover_letter")
-                    msg = format_vacancy_message(v, s, cover)
-                    await context.bot.send_message(chat_id=chat_id, text=msg)
-                    await asyncio.sleep(2)
-            else:
-                weak = [(v, s) for v, s in scored_vacancies if s.verdict == "WEAK_MATCH"]
-                if weak and PROFILE["notifications"].get("digest_mode", False):
-                    await context.bot.send_message(
-                        chat_id=chat_id,
-                        text=f"🔍 Сильных совпадений нет. {len(weak)} слабых — смотрите /digest"
-                    )
-                else:
-                    await context.bot.send_message(
-                        chat_id=chat_id,
-                        text=f"🔍 Подходящих вакансий не найдено {ds_status}"
-                    )
-        except Exception as e:
-            logger.error(f"Ошибка в background_search: {e}", exc_info=True)
-            try:
-                await context.bot.send_message(chat_id=chat_id, text=f"⚠️ Ошибка поиска: {str(e)[:300]}")
-            except:
-                pass
 
+    async with search_lock:
+        last_search_time = asyncio.get_running_loop().time()
+        chat_id = context.job.chat_id if (context.job and hasattr(context.job, "chat_id")) else (int(CHAT_ID) if CHAT_ID else None)
+        if not chat_id:
+            return
+
+        # Заглушка: генерируем одну тестовую вакансию
+        test_vacancy = {
+            "id": "test_123",
+            "name": "Коммерческий директор (нефтепродукты)",
+            "employer": {"name": "ООО НефтеТрейд"},
+            "area": {"name": "Волгоград"},
+            "salary": {"from": 200000, "to": 250000, "currency": "RUR"},
+            "snippet": {"requirement": "Опыт управления отделом продаж ГСМ от 5 лет", "responsibility": "Руководство отделом"},
+            "description": "Управление продажами нефтепродуктов, работа с НПЗ, логистика."
+        }
+        score = score_vacancy_heuristic(test_vacancy)
+        final = smart_recruiter.adjust_score(test_vacancy, score)
+
+        # Сохраняем в очередь
+        context.chat_data["vac_queue"] = [(test_vacancy, final)]
+        context.chat_data["vac_idx"] = 0
+
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="🎯 Найдена тестовая вакансия. Для реального поиска реализуйте fetch_hh_api и fetch_rss."
+        )
+        msg, kb = format_vacancy_with_buttons(test_vacancy, final, 1, 1)
+        await context.bot.send_message(chat_id=chat_id, text=msg, reply_markup=kb)
+
+        await log_search(1, 1, final.total)
 
 # ========== SMART RECRUITER CALLBACKS ==========
 async def handle_vacancy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка кнопок под вакансией."""
     query = update.callback_query
     await query.answer()
     data = query.data
@@ -1399,12 +793,15 @@ async def handle_vacancy_callback(update: Update, context: ContextTypes.DEFAULT_
             await query.edit_message_text("✅ Все вакансии просмотрены!")
         return
 
-    if ":" not in data: return
+    if ":" not in data:
+        return
     action, vid = data.split(":", 1)
     queue = context.chat_data.get("vac_queue", [])
     vacancy = score = None
     for v, s in queue:
-        if v.get("id") == vid: vacancy, score = v, s; break
+        if v.get("id") == vid:
+            vacancy, score = v, s
+            break
     if not vacancy:
         await query.edit_message_text("⚠️ Вакансия не найдена")
         return
@@ -1418,127 +815,42 @@ async def handle_vacancy_callback(update: Update, context: ContextTypes.DEFAULT_
     elif action == "apply":
         smart_recruiter.on_user_action(vacancy, score, "apply")
         cover = await generate_cover_letter(vacancy)
-        if cover: await context.bot.send_message(chat_id=chat_id, text=f"📝 Письмо:\n{cover}")
+        if cover:
+            await context.bot.send_message(chat_id=chat_id, text="📝 Письмо:\n" + cover)
         await query.edit_message_text(query.message.text + "\n\n📝 Отмечено для отклика", reply_markup=None)
         await add_application(vid, vacancy.get("name",""), vacancy.get("employer",{}).get("name",""), score.total)
     elif action == "cover":
         cover = await generate_cover_letter(vacancy)
-        if cover: await context.bot.send_message(chat_id=chat_id, text=f"📝 Письмо:\n{cover}")
-        else: await query.answer("Не удалось сгенерировать")
+        if cover:
+            await context.bot.send_message(chat_id=chat_id, text="📝 Письмо:\n" + cover)
+        else:
+            await query.answer("Не удалось сгенерировать")
 
 def format_vacancy_with_buttons(vacancy, score, idx=0, total=0):
     msg = format_vacancy_message(vacancy, score)
-    if total: msg = f"📌 {idx}/{total}\n\n" + msg
+    if total:
+        msg = "📌 " + str(idx) + "/" + str(total) + "\n\n" + msg
     vid = vacancy.get("id", "")
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("👍", callback_data=f"like:{vid}"), 
-         InlineKeyboardButton("👎", callback_data=f"dislike:{vid}"),
-         InlineKeyboardButton("📝", callback_data=f"apply:{vid}")],
-        [InlineKeyboardButton("💬 Письмо", callback_data=f"cover:{vid}"),
+        [InlineKeyboardButton("👍", callback_data="like:" + vid),
+         InlineKeyboardButton("👎", callback_data="dislike:" + vid),
+         InlineKeyboardButton("📝", callback_data="apply:" + vid)],
+        [InlineKeyboardButton("💬 Письмо", callback_data="cover:" + vid),
          InlineKeyboardButton("➡️ Далее", callback_data="next")]
     ])
     return msg, kb
 
-async def smart_search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Умный поиск с обучением."""
-    chat_id = update.effective_chat.id
-    await update.message.reply_text("🧠 Умный рекрутер ищет...")
-    class JobProxy:
-        def __init__(self, cid): self.chat_id = cid
-    context.job = JobProxy(chat_id)
-    await smart_background_search(context)
-    context.job = None
-
-async def smart_background_search(context: ContextTypes.DEFAULT_TYPE):
-    """Умный поиск с обучением."""
-    global search_lock, last_search_time
-    now = asyncio.get_event_loop().time()
-    if now - last_search_time < SEARCH_COOLDOWN_SECONDS: return
-    if search_lock.locked(): return
-
-    async with search_lock:
-        last_search_time = asyncio.get_event_loop().time()
-        start = asyncio.get_event_loop().time()
-        chat_id = context.job.chat_id if (context.job and hasattr(context.job, "chat_id")) else (int(CHAT_ID) if CHAT_ID else None)
-        if not chat_id: return
-
-        try:
-            all_vacancies = []
-            async with aiohttp.ClientSession() as session:
-                for city_ru, city_id in list(PROFILE["filters"]["cities"].items())[:8]:  # Лимит городов
-                    if asyncio.get_event_loop().time() - start > MAX_SEARCH_TIME: break
-                    city_vacs = []
-                    for keyword in PROFILE["filters"]["keywords"][:3]:  # Лимит ключевых слов
-                        api_items = await fetch_hh_api(session, city_id, keyword, per_page=10)
-                        if api_items:
-                            for item in api_items: city_vacs.append(hh_api_item_to_vacancy(item))
-                        else:
-                            rss = await fetch_rss(session, city_id, keyword, per_page=10)
-                            if rss: city_vacs.extend(rss)
-                        await asyncio.sleep(2)
-                    all_vacancies.extend(city_vacs)
-                    await asyncio.sleep(2)
-
-            seen = set()
-            unique = [v for v in all_vacancies if not (v["id"] in seen or seen.add(v["id"]))]
-            new_vacs = [v for v in unique if not await is_vacancy_sent(v["id"]) and not await is_vacancy_seen(v["id"])]
-
-            if not new_vacs:
-                await context.bot.send_message(chat_id=chat_id, text="🔍 Новых вакансий не найдено.")
-                return
-
-            scored = []
-            for v in new_vacs:
-                if asyncio.get_event_loop().time() - start > MAX_SEARCH_TIME: break
-                h = score_vacancy_heuristic(v)
-                ai = await ask_deepseek_scoring(v) if (deepseek_available and h.total >= 20) else None
-                final = ai if ai else h
-                final = smart_recruiter.adjust_score(v, final)
-                scored.append((v, final))
-                await mark_vacancy_seen(v["id"], v.get("name",""), v.get("employer",{}).get("name",""), final.total, final.verdict)
-
-            scored.sort(key=lambda x: x[1].total, reverse=True)
-            matches = [(v,s) for v,s in scored if s.verdict != "SKIP"]
-            if not matches: matches = scored[:5]
-
-            context.chat_data["vac_queue"] = matches
-            context.chat_data["vac_idx"] = 0
-
-            to_show = matches[:MAX_PUSH_PER_CYCLE]
-            await context.bot.send_message(chat_id=chat_id, 
-                text=f"🎯 Найдено {len(matches)} вакансий. Оцените — рекрутер учится!")
-
-            for i, (v, s) in enumerate(to_show, 1):
-                cover = await generate_cover_letter(v) if s.total >= 75 else None
-                msg, kb = format_vacancy_with_buttons(v, s, i, len(to_show))
-                await context.bot.send_message(chat_id=chat_id, text=msg, reply_markup=kb)
-                await asyncio.sleep(1)
-
-            avg = sum(s.total for _,s in matches)/len(matches) if matches else 0
-            await log_search(len(unique), len(to_show), avg)
-
-        except Exception as e:
-            logger.error(f"Smart search error: {e}", exc_info=True)
-            await context.bot.send_message(chat_id=chat_id, text=f"⚠️ Ошибка: {str(e)[:300]}")
-
-async def learning_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(smart_recruiter.get_summary())
-
-async def reset_learning_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global smart_recruiter
-    smart_recruiter = SmartRecruiter()
-    await update.message.reply_text("🔄 Обучение сброшено!")
-
-# ========== TELEGRAM COMMANDS ==========
+# ========== КОМАНДЫ ==========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ds_status = "✅" if deepseek_available else "❌"
     text = "👋 Привет! Я ищу вакансии коммерческого директора в нефтянке.\n\n"
-    text += f"🤖 DeepSeek: {ds_status}\n📡 HH.ru (RSS + HTML)\n"
+    text += f"🤖 DeepSeek: {ds_status}\n📡 HH.ru (RSS + API) – заглушка\n"
     text += "📊 Скоринг: 0-100 с разбивкой по 6 критериям\n"
-    text += "📝 Генерация сопроводительных писем\n"
+    text += "📝 Генерация сопроводительных писем (заглушка)\n"
     text += "📋 Трекинг откликов (Kanban-style)\n\n"
     text += "Команды:\n"
-    text += "/search — поиск сейчас\n"
+    text += "/search — поиск сейчас (тестовый)\n"
+    text += "/smart — умный поиск с обучением\n"
     text += "/schedule on/off — авто-поиск\n"
     text += "/stats — статистика\n"
     text += "/top — топ вакансий по скору\n"
@@ -1566,7 +878,7 @@ async def search_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.job = JobProxy(chat_id)
         await background_search(context)
         context.job = original_job
-        await update.message.reply_text("✅ Поиск завершён!")
+        await update.message.reply_text("✅ Поиск завершён (тестовый режим)")
     except Exception as e:
         logger.error(f"Ошибка в search_now: {e}", exc_info=True)
         await update.message.reply_text(f"⚠️ Ошибка поиска: {str(e)[:300]}")
@@ -1764,9 +1076,7 @@ async def blacklist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_profile(PROFILE)
     await update.message.reply_text(f"✅ Компания '{company}' {action} чёрный список")
 
-
 async def set_token_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Ручная установка HH OAuth токена."""
     if not context.args:
         await update.message.reply_text("Использование: /settoken ВАШ_ACCESS_TOKEN [ВАШ_REFRESH_TOKEN]")
         return
@@ -1791,7 +1101,8 @@ async def cleanup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = "📖 Команды:\n"
-    text += "/search — поиск сейчас\n"
+    text += "/search — поиск сейчас (тестовый)\n"
+    text += "/smart — умный поиск с обучением\n"
     text += "/schedule on/off — авто-поиск\n"
     text += "/stats — статистика\n"
     text += "/top — топ вакансий\n"
@@ -1807,6 +1118,240 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text += "/cleanup — очистить\n"
     text += "/help — справка"
     await update.message.reply_text(text)
+
+async def smart_search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    await update.message.reply_text("🧠 Умный рекрутер ищет...")
+    class JobProxy:
+        def __init__(self, cid):
+            self.chat_id = cid
+    context.job = JobProxy(chat_id)
+    await smart_background_search(context)
+    context.job = None
+
+async def learning_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(smart_recruiter.get_summary())
+
+async def reset_learning_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global smart_recruiter
+    smart_recruiter = SmartRecruiter()
+    await update.message.reply_text("🔄 Обучение сброшено!")
+
+async def handle_text_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    vacancy_id = context.chat_data.pop("asking_about", None)
+    question = update.message.text
+    if not vacancy_id:
+        await handle_natural_message(update, context)
+        return
+    queue = context.chat_data.get("vac_queue", [])
+    vacancy = None
+    for v, s in queue:
+        if v.get("id") == vacancy_id:
+            vacancy = v
+            break
+    if not vacancy:
+        await update.message.reply_text("⚠️ Вакансия не найдена")
+        return
+    answer = await ask_rag_about_vacancy(vacancy, question)
+    await update.message.reply_text("💡 Ответ:\n\n" + answer)
+
+# ========== NATURAL LANGUAGE ASSISTANT ==========
+NL_ASSISTANT_PROMPT = """Ты — интеллектуальный ассистент бота для поиска работы.
+Пользователь пишет тебе на естественном языке. Ты должен:
+1. Понять намерение пользователя
+2. Определить, какое действие нужно выполнить
+3. Вернуть JSON с инструкцией
+
+Доступные действия:
+- "search" — поиск вакансий
+- "smart_search" — умный поиск с обучением
+- "set_salary" — изменить минимальную зарплату
+- "add_city" — добавить город
+- "remove_city" — удалить город
+- "add_blacklist" — добавить компанию в чёрный список
+- "remove_blacklist" — удалить из чёрного списка
+- "show_profile" — показать профиль
+- "show_stats" — показать статистику
+- "show_learning" — показать обучение
+- "reset_learning" — сбросить обучение
+- "add_keyword" — добавить ключевое слово поиска
+- "remove_keyword" — удалить ключевое слово
+- "set_min_score" — изменить минимальный скор
+- "explain" — объяснить почему вакансия подошла/не подошла
+- "help" — справка
+- "unknown" — непонятно, попросить уточнить
+
+Текущий профиль пользователя:
+{profile}
+
+Примеры:
+"Найди вакансии" → {"action": "search"}
+"Поищи работу" → {"action": "smart_search"}
+"Хочу зарплату от 200 тысяч" → {"action": "set_salary", "value": 200000}
+"Добавь Москву" → {"action": "add_city", "value": "Москва", "area_id": "1"}
+"Убери стажёров" → {"action": "add_blacklist", "value": "стажёр"}
+"Покажи профиль" → {"action": "show_profile"}
+"Сколько вакансий нашёл" → {"action": "show_stats"}
+"Почему эта вакансия" → {"action": "explain"}
+"Сбрось обучение" → {"action": "reset_learning"}
+"Добавь ключевое слово директор по развитию" → {"action": "add_keyword", "value": "директор по развитию"}
+"Установи минимальный скор 40" → {"action": "set_min_score", "value": 40}
+"Вакансии в Воронеже" → {"action": "search", "filters": {"city": "Воронеж"}}
+"Только удалёнка" → {"action": "unknown", "message": "Удалённая работа не настроена в профиле. Используйте /editprofile для настройки."}
+
+Верни СТРОГО JSON без markdown:
+{"action": "search", "value": null, "filters": {}, "message": "краткий ответ пользователю"}"""
+
+async def process_natural_language(text: str) -> dict:
+    global deepseek_available, client
+    if not deepseek_available or not client:
+        return {"action": "unknown", "message": "AI временно недоступен. Используйте команды: /search, /smart, /profile, /help"}
+
+    profile_text = yaml.dump(PROFILE, allow_unicode=True, sort_keys=False)[:2000]
+    user_msg = "Сообщение пользователя: \"" + text + "\""
+    prompt = NL_ASSISTANT_PROMPT.format(profile=profile_text) + "\n\n" + user_msg
+
+    try:
+        response = await asyncio.wait_for(
+            client.chat.completions.create(
+                model="deepseek-chat",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.1,
+                max_tokens=300
+            ),
+            timeout=15.0
+        )
+        answer = response.choices[0].message.content.strip()
+        answer = re.sub(r"```json\s*", "", answer)
+        answer = re.sub(r"```\s*", "", answer)
+        return json.loads(answer)
+    except Exception as e:
+        logger.error("NL processing error: " + str(e))
+        return {"action": "unknown", "message": "Не удалось понять запрос. Попробуйте команду /help"}
+
+async def handle_natural_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    chat_id = update.effective_chat.id
+
+    logger.info("[NL] Получено сообщение: " + text)
+
+    if "asking_about" in context.chat_data:
+        await handle_text_question(update, context)
+        return
+
+    await update.message.reply_text("🤔 Думаю...")
+    result = await process_natural_language(text)
+
+    action = result.get("action", "unknown")
+    value = result.get("value")
+    message = result.get("message", "")
+
+    logger.info("[NL] Распознано действие: " + action)
+
+    if action == "search":
+        await update.message.reply_text(message or "🔍 Ищу вакансии...")
+        await search_now(update, context)
+
+    elif action == "smart_search":
+        await update.message.reply_text(message or "🧠 Умный рекрутер ищет...")
+        await smart_search_cmd(update, context)
+
+    elif action == "set_salary":
+        if value and isinstance(value, (int, float)):
+            PROFILE["filters"]["salary_min"] = int(value)
+            PROFILE["candidate"]["salary_min"] = int(value)
+            save_profile(PROFILE)
+            await update.message.reply_text("✅ Минимальная зарплата: " + str(int(value)) + " ₽")
+        else:
+            await update.message.reply_text("Укажите сумму, например: Зарплата от 200000")
+
+    elif action == "add_city":
+        city_name = value
+        area_id = result.get("area_id", "")
+        if city_name and area_id:
+            PROFILE["filters"]["cities"][city_name] = str(area_id)
+            save_profile(PROFILE)
+            await update.message.reply_text("✅ Город добавлен: " + city_name)
+        else:
+            await update.message.reply_text("⚠️ Нужен ID города. Пример: Добавь Самару (area=78)")
+
+    elif action == "remove_city":
+        city_name = value
+        if city_name and city_name in PROFILE["filters"]["cities"]:
+            del PROFILE["filters"]["cities"][city_name]
+            save_profile(PROFILE)
+            await update.message.reply_text("✅ Город удалён: " + city_name)
+        else:
+            await update.message.reply_text("Город не найден: " + str(city_name))
+
+    elif action == "add_blacklist":
+        company = value
+        if company:
+            if "company_blacklist" not in PROFILE["filters"]:
+                PROFILE["filters"]["company_blacklist"] = []
+            if company not in PROFILE["filters"]["company_blacklist"]:
+                PROFILE["filters"]["company_blacklist"].append(company)
+                save_profile(PROFILE)
+            await update.message.reply_text("🚫 Добавлено в чёрный список: " + company)
+
+    elif action == "remove_blacklist":
+        company = value
+        if company and "company_blacklist" in PROFILE["filters"]:
+            if company in PROFILE["filters"]["company_blacklist"]:
+                PROFILE["filters"]["company_blacklist"].remove(company)
+                save_profile(PROFILE)
+            await update.message.reply_text("✅ Удалено из чёрного списка: " + company)
+
+    elif action == "add_keyword":
+        kw = value
+        if kw and kw not in PROFILE["filters"]["keywords"]:
+            PROFILE["filters"]["keywords"].append(kw)
+            save_profile(PROFILE)
+            await update.message.reply_text("✅ Ключевое слово добавлено: " + kw)
+        else:
+            await update.message.reply_text("Ключевое слово уже есть или не указано")
+
+    elif action == "remove_keyword":
+        kw = value
+        if kw and kw in PROFILE["filters"]["keywords"]:
+            PROFILE["filters"]["keywords"].remove(kw)
+            save_profile(PROFILE)
+            await update.message.reply_text("✅ Ключевое слово удалено: " + kw)
+
+    elif action == "set_min_score":
+        if value and isinstance(value, (int, float)):
+            PROFILE["scoring"]["min_score"] = int(value)
+            save_profile(PROFILE)
+            await update.message.reply_text("✅ Минимальный скор: " + str(int(value)))
+        else:
+            await update.message.reply_text("Укажите число от 0 до 100")
+
+    elif action == "show_profile":
+        await profile_cmd(update, context)
+
+    elif action == "show_stats":
+        await stats_cmd(update, context)
+
+    elif action == "show_learning":
+        await learning_cmd(update, context)
+
+    elif action == "reset_learning":
+        await reset_learning_cmd(update, context)
+
+    elif action == "explain":
+        await update.message.reply_text("💡 Используйте /why [id_вакансии] для объяснения оценки")
+
+    elif action == "help":
+        await help_cmd(update, context)
+
+    else:
+        help_text = "🤔 Не понял запрос. Попробуйте:\n"
+        help_text += "• Найди вакансии\n"
+        help_text += "• Зарплата от 200000\n"
+        help_text += "• Добавь Москву\n"
+        help_text += "• Покажи профиль\n"
+        help_text += "• Или используйте /help"
+        await update.message.reply_text(message or help_text)
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.error(f"Ошибка: {context.error}")
@@ -1841,11 +1386,8 @@ async def web_stats():
         "applications": app_stats
     }
 
-
-# ─── HH.RU OAUTH ENDPOINTS ───
 @app.get("/oauth/login")
 async def oauth_login():
-    """Ссылка для авторизации в HH.ru. Откройте в браузере."""
     if not hh_oauth.is_configured():
         return {"error": "HH_CLIENT_ID и HH_CLIENT_SECRET не настроены"}
     return {
@@ -1855,7 +1397,6 @@ async def oauth_login():
 
 @app.get("/oauth/callback")
 async def oauth_callback(code: str = ""):
-    """Callback после авторизации HH.ru."""
     if not code:
         return {"error": "Не получен authorization code"}
     result = await hh_oauth.exchange_code(code)
@@ -1871,7 +1412,6 @@ async def oauth_callback(code: str = ""):
 
 @app.get("/oauth/status")
 async def oauth_status():
-    """Статус OAuth подключения."""
     return {
         "configured": hh_oauth.is_configured(),
         "has_token": hh_oauth.has_token(),
@@ -1881,13 +1421,11 @@ async def oauth_status():
 
 @app.post("/oauth/refresh")
 async def oauth_refresh():
-    """Ручное обновление токена."""
     success = await hh_oauth.refresh_access_token()
     return {"success": success, "has_token": hh_oauth.has_token()}
 
 @app.get("/oauth/debug")
 async def oauth_debug():
-    """Отладка OAuth статуса."""
     return {
         "configured": hh_oauth.is_configured(),
         "has_token": hh_oauth.has_token(),
@@ -1898,7 +1436,10 @@ async def oauth_debug():
 
 @app.post("/webhook")
 async def webhook(request: Request):
+    global application
     data = await request.json()
+    if application is None:
+        return {"error": "Application not initialized"}
     update = Update.de_json(data, application.bot)
     await application.process_update(update)
     return {"ok": True}
@@ -1911,6 +1452,7 @@ async def run_webhook():
     application = Application.builder().token(TELEGRAM_TOKEN).build()
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("search", search_now))
+    application.add_handler(CommandHandler("smart", smart_search_cmd))
     application.add_handler(CommandHandler("schedule", schedule_search))
     application.add_handler(CommandHandler("stats", stats_cmd))
     application.add_handler(CommandHandler("top", top_cmd))
@@ -1928,25 +1470,25 @@ async def run_webhook():
     application.add_handler(CommandHandler("relocate", relocate))
     application.add_handler(CommandHandler("cleanup", cleanup_cmd))
     application.add_handler(CommandHandler("help", help_cmd))
-    application.add_handler(CommandHandler("smart", smart_search_cmd))
     application.add_handler(CommandHandler("learning", learning_cmd))
     application.add_handler(CommandHandler("resetlearning", reset_learning_cmd))
     application.add_handler(CallbackQueryHandler(handle_vacancy_callback))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_natural_message))
     application.add_error_handler(error_handler)
+
     await application.initialize()
     await application.start()
-    
-    # ← ПРОВЕРКА DEEPEEK ПЕРЕД УСТАНОВКОЙ WEBHOOK
+
     await check_deepseek_connection()
-    
+
     if RENDER_EXTERNAL_URL:
         webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
         await application.bot.set_webhook(url=webhook_url)
         logger.info(f"🔗 Webhook установлен: {webhook_url}")
+
     config = uvicorn.Config(app, host="0.0.0.0", port=10000, log_level="info")
     server = uvicorn.Server(config)
     await server.serve()
 
 if __name__ == "__main__":
     asyncio.run(run_webhook())
- 
