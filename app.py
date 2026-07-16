@@ -1168,6 +1168,9 @@ async def background_search(context: ContextTypes.DEFAULT_TYPE):
                 if not await is_vacancy_sent(v["id"]) and not await is_vacancy_seen(v["id"]):
                     new_vacancies.append(v)
             logger.info(f"Найдено {len(unique)} уникальных, новых: {len(new_vacancies)}")
+            # Логируем первые 5 вакансий для отладки
+            for v in unique[:5]:
+                logger.info(f"  Вакансия: {v.get('name', 'N/A')} | {v.get('employer', {}).get('name', 'N/A')} | {v.get('area', {}).get('name', 'N/A')}")
             if not new_vacancies:
                 await context.bot.send_message(chat_id=chat_id, text="🔍 Новых вакансий не найдено.")
                 await log_search(0, 0, 0)
@@ -1195,7 +1198,13 @@ async def background_search(context: ContextTypes.DEFAULT_TYPE):
                 scored_vacancies.append((v, final_score))
                 await mark_vacancy_seen(v["id"], v.get("name", ""), v.get("employer", {}).get("name", ""), final_score.total, final_score.verdict)
                 await asyncio.sleep(0.3)
+            # DEBUG: показываем все вакансии для теста
             matches = [(v, s) for v, s in scored_vacancies if s.verdict in ("STRONG_MATCH", "MATCH")]
+            if not matches and scored_vacancies:
+                # Если нет совпадений, показываем топ-3 по скору для отладки
+                scored_vacancies.sort(key=lambda x: x[1].total, reverse=True)
+                matches = scored_vacancies[:3]
+                logger.info(f"DEBUG: Нет MATCH, показываем топ-3 по скору для отладки")
             matches.sort(key=lambda x: x[1].total, reverse=True)
             max_per_cycle = PROFILE["notifications"].get("max_per_cycle", MAX_PUSH_PER_CYCLE)
             to_send = matches[:max_per_cycle]
