@@ -7,8 +7,8 @@ import re
 import json
 import yaml
 import aiohttp
-from datetime import datetime, timedelta
-from typing import Optional, List, Dict, Any
+from datetime import datetime
+from typing import Optional, List
 from dataclasses import dataclass
 
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
@@ -25,28 +25,22 @@ import uvicorn
 from openai import AsyncOpenAI
 import httpx
 
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# === Переменные окружения ===
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 if not TELEGRAM_TOKEN:
     raise ValueError("TELEGRAM_TOKEN не задан")
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")  # опционально, но нужен для диалога
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL")
 
-# === Константы ===
 MAX_VACANCIES_PER_CYCLE = 5
 DB_PATH = "vacancies.db"
 PROFILE_PATH = "profile.yaml"
 
-# === Инициализация DeepSeek (если ключ есть) ===
+# --- DeepSeek ---
 deepseek_client = None
 deepseek_available = False
-
 if DEEPSEEK_API_KEY:
     try:
         http_client = httpx.AsyncClient(timeout=30.0, follow_redirects=True)
@@ -60,7 +54,7 @@ if DEEPSEEK_API_KEY:
     except Exception as e:
         logger.warning(f"DeepSeek init error: {e}")
 
-# === Профиль ===
+# --- Профиль ---
 DEFAULT_PROFILE = {
     "candidate": {
         "name": "Виктор Зинченко",
@@ -76,8 +70,14 @@ DEFAULT_PROFILE = {
             "Нижний Новгород": "66",
             "Уфа": "99",
             "Астана": "160",
+            "Санкт-Петербург": "2",
         },
-        "keywords": ["коммерческий директор", "директор по продажам", "руководитель отдела продаж"],
+        "keywords": [
+            "коммерческий директор",
+            "директор по продажам",
+            "руководитель отдела продаж",
+            "директор филиала",
+        ],
         "industry_keywords": ["нефтепродукты", "ГСМ", "топливо", "нефть"],
         "exclude_words": ["стажёр", "junior", "стажер"],
     },
@@ -104,12 +104,11 @@ def load_profile():
 
 PROFILE = load_profile()
 
-# === База данных ===
+# --- База данных ---
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("CREATE TABLE IF NOT EXISTS seen_vacancies (id TEXT PRIMARY KEY, title TEXT, company TEXT, score REAL, seen_at TIMESTAMP)")
-    c.execute("CREATE TABLE IF NOT EXISTS sent_vacancies (id TEXT PRIMARY KEY, title TEXT, company TEXT, score REAL, sent_at TIMESTAMP)")
     c.execute("CREATE TABLE IF NOT EXISTS applications (id INTEGER PRIMARY KEY AUTOINCREMENT, vacancy_id TEXT, title TEXT, company TEXT, score REAL, status TEXT, created_at TIMESTAMP)")
     conn.commit(); conn.close()
 init_db()
@@ -145,7 +144,7 @@ def get_stats():
     conn.close()
     return seen, apps
 
-# === Скоринг ===
+# --- Скоринг ---
 @dataclass
 class VacancyScore:
     total: float
@@ -213,17 +212,25 @@ def score_vacancy(vacancy):
                         experience_match=round(experience,1), skills_match=round(skills,1),
                         verdict=verdict, reasoning=reason)
 
-# === Запрос к HH.ru ===
-async def fetch_hh_vacancies(city_id, keyword, per_page=10):
+# --- Запрос к HH.ru (улучшенный) ---
+async def fetch_hh_vacancies(city_id, keyword, per_page=15):
+    """Ищет вакансии по городу и ключевому слову (по названию и описанию)."""
     url = "https://api.hh.ru/vacancies"
-    params = {"area": city_id, "text": keyword, "per_page": per_page, "search_field": "name"}
+    params = {
+        "area": city_id,
+        "text": keyword,
+        "per_page": per_page,
+        # убираем search_field, чтобы искать везде
+    }
     async with aiohttp.ClientSession() as session:
         try:
             async with session.get(url, params=params, timeout=10) as resp:
                 if resp.status != 200:
+                    logger.warning(f"HH API status {resp.status} for {keyword} in {city_id}")
                     return []
                 data = await resp.json()
                 items = data.get("items", [])
+                logger.info(f"Найдено {len(items)} вакансий по запросу '{keyword}' в городе {city_id}")
                 result = []
                 for item in items:
                     result.append({
@@ -232,15 +239,18 @@ async def fetch_hh_vacancies(city_id, keyword, per_page=10):
                         "employer": {"name": item.get("employer", {}).get("name")},
                         "area": {"name": item.get("area", {}).get("name")},
                         "salary": item.get("salary"),
-                        "snippet": {"requirement": item.get("snippet", {}).get("requirement", ""), "responsibility": item.get("snippet", {}).get("responsibility", "")},
-                        "description": item.get("description", "")
+                        "snippet": {
+                            "requirement": item.get("snippet", {}).get("requirement", ""),
+                            "responsibility": item.get("snippet", {}).get("responsibility", ""),
+                        },
+                        "description": item.get("description", ""),
                     })
                 return result
         except Exception as e:
             logger.error(f"fetch_hh error: {e}")
             return []
 
-# === Форматирование ===
+# --- Форматирование ---
 def format_vacancy(v, score, idx, total):
     sal = v.get("salary")
     sal_str = f"{sal.get('from','')} - {sal.get('to','')} {sal.get('currency','')}".strip() if sal else "не указана"
@@ -257,9 +267,9 @@ def format_vacancy(v, score, idx, total):
     ])
     return msg, kb
 
-# === Команды ===
+# --- Команды ---
 async def start(update, context):
-    await update.message.reply_text("👋 Привет! Я умею искать вакансии и отвечать на вопросы.\n"
+    await update.message.reply_text("👋 Привет! Я умею искать вакансии коммерческого директора.\n"
                                     "Напиши что-нибудь, я постараюсь помочь.\n"
                                     "Команды: /search, /stats, /help")
 
@@ -267,33 +277,44 @@ async def search_command(update, context):
     await update.message.reply_text("🔍 Ищу вакансии, подождите...")
     await do_search(update, context)
 
-async def do_search(update, context):
+async def do_search(update, context, force=False):
     chat_id = update.effective_chat.id
-    cities = list(PROFILE["filters"]["cities"].items())[:3]
-    keywords = PROFILE["filters"]["keywords"][:2]
+    cities = list(PROFILE["filters"]["cities"].items())  # берём все города
+    keywords = PROFILE["filters"]["keywords"]  # все ключевые слова
+
     all_vacancies = []
     for city_name, city_id in cities:
         for kw in keywords:
-            vacs = await fetch_hh_vacancies(city_id, kw, per_page=5)
+            vacs = await fetch_hh_vacancies(city_id, kw, per_page=15)
             all_vacancies.extend(vacs)
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.3)  # небольшая пауза
 
+    # Удаляем дубликаты по ID
     seen_ids = set()
     unique = []
     for v in all_vacancies:
-        if v["id"] in seen_ids: continue
+        if v["id"] in seen_ids:
+            continue
         seen_ids.add(v["id"])
-        if is_seen(v["id"]): continue
+        if not force and is_seen(v["id"]):
+            continue
         unique.append(v)
+
     if not unique:
-        await context.bot.send_message(chat_id, "📭 Новых вакансий не найдено.")
+        await context.bot.send_message(chat_id, "📭 Новых вакансий не найдено.\n"
+                                        "Попробуйте расширить критерии поиска (измените profile.yaml) "
+                                        "или подождите появления новых вакансий.")
         return
 
+    # Скоринг
     scored = [(v, score_vacancy(v)) for v in unique]
     scored.sort(key=lambda x: x[1].total, reverse=True)
+    # Оставляем только MATCH/STRONG, если есть, иначе топ-5
     good = [(v,s) for v,s in scored if s.verdict in ("MATCH","STRONG_MATCH")]
-    if not good: good = scored[:MAX_VACANCIES_PER_CYCLE]
-    else: good = good[:MAX_VACANCIES_PER_CYCLE]
+    if not good:
+        good = scored[:MAX_VACANCIES_PER_CYCLE]
+    else:
+        good = good[:MAX_VACANCIES_PER_CYCLE]
 
     context.chat_data["vacancies"] = good
     context.chat_data["index"] = 0
@@ -347,11 +368,10 @@ async def stats_command(update, context):
 async def help_command(update, context):
     await update.message.reply_text("📖 Команды:\n/search – поиск\n/stats – статистика\n/help – помощь\n\nПросто пишите, я отвечу.")
 
-# === Диалог через DeepSeek ===
-async def deepseek_chat(message: str, context: Optional[dict] = None) -> str:
+# --- Диалог через DeepSeek ---
+async def deepseek_chat(message: str) -> str:
     if not deepseek_available:
         return "Извините, я сейчас не могу ответить (нет подключения к ИИ). Попробуйте команду /help."
-
     system_prompt = (
         "Ты — помощник по поиску работы. Ты помогаешь пользователю найти вакансии коммерческого директора "
         "в нефтяной отрасли. Отвечай кратко, по делу, на русском языке. Если спрашивают о вакансиях – уточни, "
@@ -375,7 +395,7 @@ async def deepseek_chat(message: str, context: Optional[dict] = None) -> str:
         logger.error(f"DeepSeek error: {e}")
         return "⚠️ Ошибка при обращении к ИИ. Попробуйте позже."
 
-# === Эвристический парсер (для быстрых команд) ===
+# --- Эвристический парсер ---
 def parse_natural(text: str) -> Optional[str]:
     text = text.lower().strip()
     if any(w in text for w in ["привет", "здравствуй", "ку"]):
@@ -399,12 +419,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await help_command(update, context)
         return
 
-    # Если не распознано как команда – отправляем в DeepSeek
+    # Диалог
     await update.message.reply_text("🤔 Думаю...")
     reply = await deepseek_chat(text)
     await update.message.reply_text(reply)
 
-# === Webhook и запуск ===
+# --- Webhook ---
 app = FastAPI()
 telegram_app = None
 
