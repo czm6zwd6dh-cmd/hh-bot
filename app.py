@@ -7,6 +7,7 @@ import re
 import json
 import yaml
 import aiohttp
+import random
 from datetime import datetime
 from typing import Optional, List
 from dataclasses import dataclass
@@ -39,6 +40,9 @@ MAX_VACANCIES_PER_CYCLE = 5
 DB_PATH = "vacancies.db"
 PROFILE_PATH = "profile.yaml"
 
+# Глобальный флаг для блокировки одновременных поисков
+search_in_progress = False
+
 # --- DeepSeek (опционально) ---
 deepseek_client = None
 deepseek_available = False
@@ -70,14 +74,12 @@ DEFAULT_PROFILE = {
             "Казань": "88",
             "Нижний Новгород": "66",
             "Уфа": "99",
-            "Астана": "160",
             "Санкт-Петербург": "2",
         },
         "keywords": [
             "коммерческий директор",
             "директор по продажам",
             "руководитель отдела продаж",
-            "директор филиала",
         ],
         "industry_keywords": ["нефтепродукты", "ГСМ", "топливо", "нефть"],
         "exclude_words": ["стажёр", "junior", "стажер"],
@@ -215,14 +217,17 @@ def score_vacancy(vacancy):
 
 # --- Функция для RSS (запасной вариант) ---
 async def fetch_hh_rss(city_id, keyword, per_page=10):
-    """Получает вакансии через RSS-ленту (не требует API-ключа)."""
-    url = f"https://hh.ru/rss/vacancy?text={keyword}&area={city_id}&per_page={per_page}"
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    """Получает вакансии через RSS-ленту."""
+    # Убираем per_page, так как RSS всегда возвращает 10 последних
+    url = f"https://hh.ru/rss/vacancy?text={keyword}&area={city_id}"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
     async with aiohttp.ClientSession() as session:
         try:
             async with session.get(url, headers=headers, timeout=10) as resp:
                 if resp.status != 200:
-                    logger.warning(f"RSS status {resp.status} for {keyword}")
+                    logger.warning(f"RSS status {resp.status} for {keyword} in {city_id}")
                     return []
                 xml_text = await resp.text()
                 root = ET.fromstring(xml_text)
@@ -239,20 +244,15 @@ async def fetch_hh_rss(city_id, keyword, per_page=10):
                     city = ""
                     if "Город:" in description:
                         city = description.split("Город:")[1].split("<")[0].strip()
-                    # Извлекаем зарплату
-                    salary = None
-                    if "Зарплата:" in description:
-                        sal_part = description.split("Зарплата:")[1].split("<")[0].strip()
-                        # можно попытаться распарсить, но оставим строкой
                     # ID из ссылки
                     vid = link.split("/")[-1] if link else "0"
                     items.append({
                         "id": vid,
-                        "name": title,
                         "url": link,
+                        "name": title,
                         "employer": {"name": company},
                         "area": {"name": city},
-                        "salary": None,  # RSS не даёт структурированную зарплату, можно оставить None
+                        "salary": None,
                         "snippet": {"requirement": description[:200], "responsibility": ""},
                         "description": description,
                     })
@@ -261,21 +261,31 @@ async def fetch_hh_rss(city_id, keyword, per_page=10):
             logger.error(f"RSS error: {e}")
             return []
 
-# --- Запрос к HH.ru API с полными заголовками ---
+# --- Запрос к HH.ru API с полными заголовками и случайным User-Agent ---
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+]
+
 async def fetch_hh_api(city_id, keyword, per_page=15):
-    """Ищет через API с правильными заголовками."""
     url = "https://api.hh.ru/vacancies"
     params = {
         "area": city_id,
         "text": keyword,
         "per_page": per_page,
+        "order_by": "publication_time",
     }
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "User-Agent": random.choice(USER_AGENTS),
         "Accept": "application/json, text/plain, */*",
         "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Accept-Encoding": "gzip, deflate, br",
         "Referer": "https://hh.ru/",
         "Connection": "keep-alive",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
     }
     async with aiohttp.ClientSession() as session:
         try:
@@ -311,9 +321,8 @@ async def fetch_hh_api(city_id, keyword, per_page=15):
 
 # --- Основная функция поиска ---
 async def fetch_hh_vacancies(city_id, keyword, per_page=15):
-    """Сначала пытается через API, при ошибке 403 использует RSS."""
     api_result = await fetch_hh_api(city_id, keyword, per_page)
-    if api_result is None:  # 403
+    if api_result is None:
         logger.info(f"Используем RSS для {keyword} в {city_id}")
         return await fetch_hh_rss(city_id, keyword, per_page)
     return api_result if api_result is not None else []
@@ -328,16 +337,16 @@ def format_vacancy(v, score, idx, total):
            f"• Зарплата: {score.salary_match}/10\n• Локация: {score.location_match}/10\n• Опыт: {score.experience_match}/10\n"
            f"• Навыки: {score.skills_match}/10\n\n💬 {score.reasoning}")
     vid = v.get("id")
-    # Клавиатура: добавили кнопку "Перейти"
+    # Клавиатура с кнопкой "Перейти"
     kb_buttons = [
         [InlineKeyboardButton("👍", callback_data=f"like:{vid}"),
          InlineKeyboardButton("👎", callback_data=f"dislike:{vid}"),
          InlineKeyboardButton("📝", callback_data=f"apply:{vid}")],
-        [InlineKeyboardButton("🔗 Перейти", url=url) if url else None,
-         InlineKeyboardButton("➡️ Далее", callback_data="next")]
+        []
     ]
-    # Убираем None
-    kb_buttons[1] = [btn for btn in kb_buttons[1] if btn is not None]
+    if url:
+        kb_buttons[1].append(InlineKeyboardButton("🔗 Перейти", url=url))
+    kb_buttons[1].append(InlineKeyboardButton("➡️ Далее", callback_data="next"))
     kb = InlineKeyboardMarkup(kb_buttons)
     return msg, kb
 
@@ -348,58 +357,71 @@ async def start(update, context):
                                     "Команды: /search, /stats, /help")
 
 async def search_command(update, context):
+    global search_in_progress
+    if search_in_progress:
+        await update.message.reply_text("⏳ Поиск уже выполняется, подождите немного.")
+        return
     await update.message.reply_text("🔍 Ищу вакансии, подождите...")
     await do_search(update, context)
 
 async def do_search(update, context, force=False):
-    chat_id = update.effective_chat.id
-    cities = list(PROFILE["filters"]["cities"].items())
-    keywords = PROFILE["filters"]["keywords"]
+    global search_in_progress
+    if search_in_progress:
+        return
+    search_in_progress = True
+    try:
+        chat_id = update.effective_chat.id
+        # Берём первые 2 города и 2 ключевых слова для скорости
+        cities = list(PROFILE["filters"]["cities"].items())[:2]
+        keywords = PROFILE["filters"]["keywords"][:2]
 
-    all_vacancies = []
-    api_blocked = False
-    for city_name, city_id in cities:
-        for kw in keywords:
-            vacs = await fetch_hh_vacancies(city_id, kw, per_page=15)
-            if vacs is None:
-                api_blocked = True
+        all_vacancies = []
+        api_blocked = False
+        for city_name, city_id in cities:
+            for kw in keywords:
+                vacs = await fetch_hh_vacancies(city_id, kw, per_page=10)
+                if vacs is None:
+                    api_blocked = True
+                    continue
+                all_vacancies.extend(vacs)
+                # Случайная задержка 3-5 секунд между запросами
+                await asyncio.sleep(random.uniform(3, 5))
+
+        if api_blocked and not all_vacancies:
+            await context.bot.send_message(chat_id, "⚠️ API HH.ru временно недоступен (403). Попробуйте позже или измените ключевые слова.")
+            return
+
+        # Удаляем дубликаты и уже просмотренные
+        seen_ids = set()
+        unique = []
+        for v in all_vacancies:
+            if v["id"] in seen_ids:
                 continue
-            all_vacancies.extend(vacs)
-            await asyncio.sleep(2)  # пауза
+            seen_ids.add(v["id"])
+            if not force and is_seen(v["id"]):
+                continue
+            unique.append(v)
 
-    if api_blocked and not all_vacancies:
-        await context.bot.send_message(chat_id, "⚠️ API HH.ru временно недоступен (403). Попробуйте позже или измените ключевые слова.")
-        return
+        if not unique:
+            await context.bot.send_message(chat_id, "📭 Новых вакансий не найдено.\n"
+                                            "Попробуйте расширить критерии поиска (измените profile.yaml) "
+                                            "или подождите появления новых вакансий.")
+            return
 
-    # Удаляем дубликаты и уже просмотренные
-    seen_ids = set()
-    unique = []
-    for v in all_vacancies:
-        if v["id"] in seen_ids:
-            continue
-        seen_ids.add(v["id"])
-        if not force and is_seen(v["id"]):
-            continue
-        unique.append(v)
+        # Скоринг
+        scored = [(v, score_vacancy(v)) for v in unique]
+        scored.sort(key=lambda x: x[1].total, reverse=True)
+        good = [(v,s) for v,s in scored if s.verdict in ("MATCH","STRONG_MATCH")]
+        if not good:
+            good = scored[:MAX_VACANCIES_PER_CYCLE]
+        else:
+            good = good[:MAX_VACANCIES_PER_CYCLE]
 
-    if not unique:
-        await context.bot.send_message(chat_id, "📭 Новых вакансий не найдено.\n"
-                                        "Попробуйте расширить критерии поиска (измените profile.yaml) "
-                                        "или подождите появления новых вакансий.")
-        return
-
-    # Скоринг
-    scored = [(v, score_vacancy(v)) for v in unique]
-    scored.sort(key=lambda x: x[1].total, reverse=True)
-    good = [(v,s) for v,s in scored if s.verdict in ("MATCH","STRONG_MATCH")]
-    if not good:
-        good = scored[:MAX_VACANCIES_PER_CYCLE]
-    else:
-        good = good[:MAX_VACANCIES_PER_CYCLE]
-
-    context.chat_data["vacancies"] = good
-    context.chat_data["index"] = 0
-    await show_vacancy(update, context, 0)
+        context.chat_data["vacancies"] = good
+        context.chat_data["index"] = 0
+        await show_vacancy(update, context, 0)
+    finally:
+        search_in_progress = False
 
 async def show_vacancy(update, context, idx):
     vacancies = context.chat_data.get("vacancies", [])
@@ -549,4 +571,4 @@ async def run():
     await server.serve()
 
 if __name__ == "__main__":
-    asyncio.run(run()) 
+    asyncio.run(run())
