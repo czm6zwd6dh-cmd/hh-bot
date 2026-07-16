@@ -4,7 +4,6 @@ import asyncio
 import logging
 import re
 import json
-import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from typing import Optional, Dict, List, Any
 from dataclasses import dataclass
@@ -13,11 +12,9 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Mess
 from openai import AsyncOpenAI
 import httpx
 import aiohttp
-import random
 from fastapi import FastAPI, Request
 import uvicorn
 import yaml
-import urllib.parse
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -390,7 +387,6 @@ def calculate_location_score(city: str) -> float:
     for c in allowed_cities:
         if c.lower() in city_lower:
             return 10.0
-    # Простейшие синонимы (можно расширить)
     variants = {
         "волгоград": ["волжский", "камышин"],
         "москва": ["московская", "химки", "красногорск"],
@@ -640,21 +636,15 @@ class SmartRecruiter:
 smart_recruiter = SmartRecruiter()
 
 # ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ (ЗАГЛУШКИ) ==========
-# Эти функции необходимо реализовать для полноценной работы.
-# Здесь приведены минимальные заглушки, чтобы код не падал при запуске.
-
 async def fetch_hh_api(session, area_id, keyword, per_page=10):
-    """Заглушка для получения вакансий через API HH.ru"""
     logger.warning("fetch_hh_api не реализован, возвращаем пустой список")
     return []
 
 async def fetch_rss(session, area_id, keyword, per_page=10):
-    """Заглушка для получения вакансий через RSS HH.ru"""
     logger.warning("fetch_rss не реализован, возвращаем пустой список")
     return []
 
 def hh_api_item_to_vacancy(item):
-    """Заглушка преобразования элемента API в словарь вакансии"""
     return {
         "id": item.get("id", "0"),
         "name": item.get("name", "Вакансия"),
@@ -666,7 +656,6 @@ def hh_api_item_to_vacancy(item):
     }
 
 def format_vacancy_message(vacancy, score):
-    """Форматирование сообщения для отправки"""
     msg = f"<b>{vacancy.get('name', 'Без названия')}</b>\n"
     msg += f"🏢 {vacancy.get('employer', {}).get('name', 'Неизвестно')}\n"
     msg += f"📍 {vacancy.get('area', {}).get('name', 'Не указан')}\n"
@@ -686,19 +675,16 @@ def format_vacancy_message(vacancy, score):
     return msg
 
 def format_digest(weak_list):
-    """Форматирование дайджеста слабых совпадений"""
     msg = "📋 Дайджест слабых совпадений:\n\n"
     for vid, title, company, score, seen_at in weak_list:
         msg += f"• {title} — {company} (скор {score:.0f})\n"
     return msg
 
 async def generate_cover_letter(vacancy):
-    """Заглушка для генерации сопроводительного письма"""
     logger.warning("generate_cover_letter не реализован, возвращаем заглушку")
     return "Здравствуйте! Меня заинтересовала ваша вакансия. Я обладаю необходимым опытом и навыками. Готов обсудить детали."
 
 async def ask_rag_about_vacancy(vacancy, question):
-    """Заглушка для ответа на вопросы о вакансии"""
     return f"Извините, функция ответа на вопросы о вакансии в разработке. Ваш вопрос: {question}"
 
 # ========== OAuth ДЛЯ HH.RU (ЗАГЛУШКА) ==========
@@ -709,7 +695,7 @@ class HHOAuth:
         self.token_expires_at = None
 
     def is_configured(self):
-        return False  # Пока не настроен
+        return False
 
     def has_token(self):
         return self.access_token is not None
@@ -730,11 +716,9 @@ hh_oauth = HHOAuth()
 
 # ========== ОСНОВНЫЕ ФУНКЦИИ ПОИСКА ==========
 async def background_search(context: ContextTypes.DEFAULT_TYPE):
-    """Фоновый поиск вакансий (заглушка, использует smart_background_search)"""
     await smart_background_search(context)
 
 async def smart_background_search(context: ContextTypes.DEFAULT_TYPE):
-    """Умный поиск с обучением (заглушка – показывает тестовые данные)"""
     global search_lock, last_search_time
     now = asyncio.get_running_loop().time()
     if now - last_search_time < SEARCH_COOLDOWN_SECONDS:
@@ -748,7 +732,7 @@ async def smart_background_search(context: ContextTypes.DEFAULT_TYPE):
         if not chat_id:
             return
 
-        # Заглушка: генерируем одну тестовую вакансию
+        # Тестовая вакансия
         test_vacancy = {
             "id": "test_123",
             "name": "Коммерческий директор (нефтепродукты)",
@@ -761,7 +745,6 @@ async def smart_background_search(context: ContextTypes.DEFAULT_TYPE):
         score = score_vacancy_heuristic(test_vacancy)
         final = smart_recruiter.adjust_score(test_vacancy, score)
 
-        # Сохраняем в очередь
         context.chat_data["vac_queue"] = [(test_vacancy, final)]
         context.chat_data["vac_idx"] = 0
 
@@ -1222,18 +1205,30 @@ async def process_natural_language(text: str) -> dict:
             timeout=15.0
         )
         answer = response.choices[0].message.content.strip()
+        logger.info(f"Raw AI response: {answer}")  # ← Логируем ответ для отладки
         answer = re.sub(r"```json\s*", "", answer)
         answer = re.sub(r"```\s*", "", answer)
-        return json.loads(answer)
+        result = json.loads(answer)
+        # Проверяем, что result — словарь и содержит action
+        if not isinstance(result, dict):
+            raise ValueError("Ответ AI не является словарём")
+        if "action" not in result:
+            # Если action отсутствует, подставляем unknown
+            result["action"] = "unknown"
+            result["message"] = result.get("message", "Не удалось определить действие")
+        return result
+    except json.JSONDecodeError as e:
+        logger.error(f"JSON decode error: {e}, ответ: {answer}")
+        return {"action": "unknown", "message": "Ошибка обработки ответа от AI. Попробуйте ещё раз."}
     except Exception as e:
-        logger.error("NL processing error: " + str(e))
+        logger.error(f"NL processing error: {e}")
         return {"action": "unknown", "message": "Не удалось понять запрос. Попробуйте команду /help"}
 
 async def handle_natural_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     chat_id = update.effective_chat.id
 
-    logger.info("[NL] Получено сообщение: " + text)
+    logger.info(f"[NL] Получено сообщение: {text}")
 
     if "asking_about" in context.chat_data:
         await handle_text_question(update, context)
@@ -1242,11 +1237,12 @@ async def handle_natural_message(update: Update, context: ContextTypes.DEFAULT_T
     await update.message.reply_text("🤔 Думаю...")
     result = await process_natural_language(text)
 
+    # Безопасно получаем action, даже если ключа нет
     action = result.get("action", "unknown")
     value = result.get("value")
     message = result.get("message", "")
 
-    logger.info("[NL] Распознано действие: " + action)
+    logger.info(f"[NL] Распознано действие: {action}")
 
     if action == "search":
         await update.message.reply_text(message or "🔍 Ищу вакансии...")
@@ -1261,7 +1257,7 @@ async def handle_natural_message(update: Update, context: ContextTypes.DEFAULT_T
             PROFILE["filters"]["salary_min"] = int(value)
             PROFILE["candidate"]["salary_min"] = int(value)
             save_profile(PROFILE)
-            await update.message.reply_text("✅ Минимальная зарплата: " + str(int(value)) + " ₽")
+            await update.message.reply_text(f"✅ Минимальная зарплата: {int(value)} ₽")
         else:
             await update.message.reply_text("Укажите сумму, например: Зарплата от 200000")
 
@@ -1271,7 +1267,7 @@ async def handle_natural_message(update: Update, context: ContextTypes.DEFAULT_T
         if city_name and area_id:
             PROFILE["filters"]["cities"][city_name] = str(area_id)
             save_profile(PROFILE)
-            await update.message.reply_text("✅ Город добавлен: " + city_name)
+            await update.message.reply_text(f"✅ Город добавлен: {city_name}")
         else:
             await update.message.reply_text("⚠️ Нужен ID города. Пример: Добавь Самару (area=78)")
 
@@ -1280,9 +1276,9 @@ async def handle_natural_message(update: Update, context: ContextTypes.DEFAULT_T
         if city_name and city_name in PROFILE["filters"]["cities"]:
             del PROFILE["filters"]["cities"][city_name]
             save_profile(PROFILE)
-            await update.message.reply_text("✅ Город удалён: " + city_name)
+            await update.message.reply_text(f"✅ Город удалён: {city_name}")
         else:
-            await update.message.reply_text("Город не найден: " + str(city_name))
+            await update.message.reply_text(f"Город не найден: {city_name}")
 
     elif action == "add_blacklist":
         company = value
@@ -1292,7 +1288,7 @@ async def handle_natural_message(update: Update, context: ContextTypes.DEFAULT_T
             if company not in PROFILE["filters"]["company_blacklist"]:
                 PROFILE["filters"]["company_blacklist"].append(company)
                 save_profile(PROFILE)
-            await update.message.reply_text("🚫 Добавлено в чёрный список: " + company)
+            await update.message.reply_text(f"🚫 Добавлено в чёрный список: {company}")
 
     elif action == "remove_blacklist":
         company = value
@@ -1300,14 +1296,14 @@ async def handle_natural_message(update: Update, context: ContextTypes.DEFAULT_T
             if company in PROFILE["filters"]["company_blacklist"]:
                 PROFILE["filters"]["company_blacklist"].remove(company)
                 save_profile(PROFILE)
-            await update.message.reply_text("✅ Удалено из чёрного списка: " + company)
+            await update.message.reply_text(f"✅ Удалено из чёрного списка: {company}")
 
     elif action == "add_keyword":
         kw = value
         if kw and kw not in PROFILE["filters"]["keywords"]:
             PROFILE["filters"]["keywords"].append(kw)
             save_profile(PROFILE)
-            await update.message.reply_text("✅ Ключевое слово добавлено: " + kw)
+            await update.message.reply_text(f"✅ Ключевое слово добавлено: {kw}")
         else:
             await update.message.reply_text("Ключевое слово уже есть или не указано")
 
@@ -1316,13 +1312,13 @@ async def handle_natural_message(update: Update, context: ContextTypes.DEFAULT_T
         if kw and kw in PROFILE["filters"]["keywords"]:
             PROFILE["filters"]["keywords"].remove(kw)
             save_profile(PROFILE)
-            await update.message.reply_text("✅ Ключевое слово удалено: " + kw)
+            await update.message.reply_text(f"✅ Ключевое слово удалено: {kw}")
 
     elif action == "set_min_score":
         if value and isinstance(value, (int, float)):
             PROFILE["scoring"]["min_score"] = int(value)
             save_profile(PROFILE)
-            await update.message.reply_text("✅ Минимальный скор: " + str(int(value)))
+            await update.message.reply_text(f"✅ Минимальный скор: {int(value)}")
         else:
             await update.message.reply_text("Укажите число от 0 до 100")
 
