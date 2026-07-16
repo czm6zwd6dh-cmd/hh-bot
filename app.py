@@ -199,6 +199,12 @@ def _init_db_sync():
     )""")
     c.execute("""CREATE INDEX IF NOT EXISTS idx_seen_at ON seen_vacancies(seen_at)""")
     c.execute("""CREATE INDEX IF NOT EXISTS idx_sent_at ON sent_vacancies(sent_at)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS oauth_tokens (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        access_token TEXT,
+        refresh_token TEXT,
+        expires_at TIMESTAMP
+    )""")
     conn.commit()
     conn.close()
 
@@ -293,6 +299,30 @@ def _get_applications_sync(status=None):
     result = c.fetchall()
     conn.close()
     return result
+
+
+def _save_oauth_tokens_sync(access_token, refresh_token, expires_at):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("DELETE FROM oauth_tokens")
+    c.execute("INSERT INTO oauth_tokens (id, access_token, refresh_token, expires_at) VALUES (?, ?, ?, ?)",
+              (1, access_token, refresh_token, expires_at))
+    conn.commit()
+    conn.close()
+
+def _load_oauth_tokens_sync():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT access_token, refresh_token, expires_at FROM oauth_tokens WHERE id = 1")
+    row = c.fetchone()
+    conn.close()
+    return row
+
+async def save_oauth_tokens(access_token, refresh_token, expires_at):
+    await asyncio.to_thread(_save_oauth_tokens_sync, access_token, refresh_token, expires_at)
+
+async def load_oauth_tokens():
+    return await asyncio.to_thread(_load_oauth_tokens_sync)
 
 def _cleanup_sync(days=30):
     conn = sqlite3.connect(DB_PATH)
@@ -759,33 +789,38 @@ class HHOAuthClient:
         return True
 
     async def save_tokens(self):
-        """Сохранить токены в файл для переживания перезапусков."""
+        """Сохранить токены в SQLite БД (persistent на Render)."""
         try:
-            data = {
-                "access_token": self.access_token,
-                "refresh_token": self.refresh_token,
-                "expires_at": self.token_expires_at.isoformat() if self.token_expires_at else None,
-            }
-            with open("hh_tokens.json", "w", encoding="utf-8") as f:
-                json.dump(data, f)
-            logger.info("HH OAuth: токены сохранены в файл")
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            c.execute("DELETE FROM oauth_tokens")
+            c.execute("INSERT INTO oauth_tokens (id, access_token, refresh_token, expires_at) VALUES (?, ?, ?, ?)",
+                      (1, self.access_token, self.refresh_token,
+                       self.token_expires_at.isoformat() if self.token_expires_at else None))
+            conn.commit()
+            conn.close()
+            logger.info("HH OAuth: токены сохранены в БД")
         except Exception as e:
-            logger.error(f"HH OAuth: ошибка сохранения токенов: {e}")
+            logger.error(f"HH OAuth: ошибка сохранения токенов в БД: {e}")
 
     def load_tokens(self):
-        """Загрузить токены из файла при старте."""
+        """Загрузить токены из SQLite БД при старте."""
         try:
-            if os.path.exists("hh_tokens.json"):
-                with open("hh_tokens.json", "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                self.access_token = data.get("access_token") or self.access_token
-                self.refresh_token = data.get("refresh_token") or self.refresh_token
-                expires_at_str = data.get("expires_at")
-                if expires_at_str:
-                    self.token_expires_at = datetime.fromisoformat(expires_at_str)
-                logger.info("HH OAuth: токены загружены из файла")
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            c.execute("SELECT access_token, refresh_token, expires_at FROM oauth_tokens WHERE id = 1")
+            row = c.fetchone()
+            conn.close()
+            if row:
+                self.access_token = row[0] or self.access_token
+                self.refresh_token = row[1] or self.refresh_token
+                if row[2]:
+                    self.token_expires_at = datetime.fromisoformat(row[2])
+                logger.info("HH OAuth: токены загружены из БД")
+            else:
+                logger.info("HH OAuth: токены в БД не найдены")
         except Exception as e:
-            logger.error(f"HH OAuth: ошибка загрузки токенов: {e}")
+            logger.error(f"HH OAuth: ошибка загрузки токенов из БД: {e}")
 
     def get_headers(self) -> dict:
         """Заголовки для авторизованных запросов к API."""
@@ -814,6 +849,8 @@ async def fetch_hh_api(session, city_id, keyword, per_page=20, page=0):
 
     await hh_rate_limiter.wait()
     logger.info(f"[HH-API] Запрос: {keyword} в area={city_id}")
+        token_preview = hh_oauth.access_token[:20] + "..." if hh_oauth.access_token else "НЕТ"
+        logger.info(f"[HH-API] Токен: {token_preview}")
 
     try:
         timeout = aiohttp.ClientTimeout(total=30, connect=10)
@@ -1535,6 +1572,32 @@ async def oauth_refresh():
     """Ручное обновление токена."""
     success = await hh_oauth.refresh_access_token()
     return {"success": success, "has_token": hh_oauth.has_token()}
+
+@app.post("/oauth/manual")
+async def oauth_manual(request: Request):
+    """Ручной ввод токенов (если OAuth flow не работает)."""
+    data = await request.json()
+    access_token = data.get("access_token")
+    refresh_token = data.get("refresh_token")
+    if not access_token:
+        return {"error": "access_token обязателен"}
+    hh_oauth.access_token = access_token
+    hh_oauth.refresh_token = refresh_token
+    hh_oauth.token_expires_at = datetime.now() + timedelta(days=14)
+    await hh_oauth.save_tokens()
+    return {"success": True, "message": "Токены сохранены вручную"}
+
+@app.get("/oauth/debug")
+async def oauth_debug():
+    """Отладка OAuth статуса."""
+    return {
+        "configured": hh_oauth.is_configured(),
+        "has_token": hh_oauth.has_token(),
+        "token_preview": hh_oauth.access_token[:20] + "..." if hh_oauth.access_token else None,
+        "refresh_preview": hh_oauth.refresh_token[:20] + "..." if hh_oauth.refresh_token else None,
+        "expires": hh_oauth.token_expires_at.isoformat() if hh_oauth.token_expires_at else None,
+        "headers_auth": "Bearer" in str(hh_oauth.get_headers()),
+    }
 
 @app.post("/webhook")
 async def webhook(request: Request):
