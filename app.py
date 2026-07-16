@@ -24,6 +24,7 @@ from fastapi import FastAPI, Request
 import uvicorn
 from openai import AsyncOpenAI
 import httpx
+import xml.etree.ElementTree as ET
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -38,7 +39,7 @@ MAX_VACANCIES_PER_CYCLE = 5
 DB_PATH = "vacancies.db"
 PROFILE_PATH = "profile.yaml"
 
-# --- DeepSeek ---
+# --- DeepSeek (опционально) ---
 deepseek_client = None
 deepseek_available = False
 if DEEPSEEK_API_KEY:
@@ -212,9 +213,57 @@ def score_vacancy(vacancy):
                         experience_match=round(experience,1), skills_match=round(skills,1),
                         verdict=verdict, reasoning=reason)
 
-# --- ЗАПРОС К HH.RU (С User-Agent) ---
-async def fetch_hh_vacancies(city_id, keyword, per_page=15):
-    """Ищет вакансии с корректным User-Agent."""
+# --- Функция для RSS (запасной вариант) ---
+async def fetch_hh_rss(city_id, keyword, per_page=10):
+    """Получает вакансии через RSS-ленту (не требует API-ключа)."""
+    url = f"https://hh.ru/rss/vacancy?text={keyword}&area={city_id}&per_page={per_page}"
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.get(url, headers=headers, timeout=10) as resp:
+                if resp.status != 200:
+                    logger.warning(f"RSS status {resp.status} for {keyword}")
+                    return []
+                xml_text = await resp.text()
+                root = ET.fromstring(xml_text)
+                items = []
+                for item in root.findall(".//item"):
+                    title = item.find("title").text if item.find("title") is not None else ""
+                    link = item.find("link").text if item.find("link") is not None else ""
+                    description = item.find("description").text if item.find("description") is not None else ""
+                    # Извлекаем компанию из description
+                    company = "Неизвестно"
+                    if "Компания:" in description:
+                        company = description.split("Компания:")[1].split("<")[0].strip()
+                    # Извлекаем город
+                    city = ""
+                    if "Город:" in description:
+                        city = description.split("Город:")[1].split("<")[0].strip()
+                    # Извлекаем зарплату
+                    salary = None
+                    if "Зарплата:" in description:
+                        sal_part = description.split("Зарплата:")[1].split("<")[0].strip()
+                        # можно попытаться распарсить, но оставим строкой
+                    # ID из ссылки
+                    vid = link.split("/")[-1] if link else "0"
+                    items.append({
+                        "id": vid,
+                        "name": title,
+                        "url": link,
+                        "employer": {"name": company},
+                        "area": {"name": city},
+                        "salary": None,  # RSS не даёт структурированную зарплату, можно оставить None
+                        "snippet": {"requirement": description[:200], "responsibility": ""},
+                        "description": description,
+                    })
+                return items[:per_page]
+        except Exception as e:
+            logger.error(f"RSS error: {e}")
+            return []
+
+# --- Запрос к HH.ru API с полными заголовками ---
+async def fetch_hh_api(city_id, keyword, per_page=15):
+    """Ищет через API с правильными заголовками."""
     url = "https://api.hh.ru/vacancies"
     params = {
         "area": city_id,
@@ -222,21 +271,29 @@ async def fetch_hh_vacancies(city_id, keyword, per_page=15):
         "per_page": per_page,
     }
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Referer": "https://hh.ru/",
+        "Connection": "keep-alive",
     }
     async with aiohttp.ClientSession() as session:
         try:
             async with session.get(url, params=params, headers=headers, timeout=15) as resp:
+                if resp.status == 403:
+                    logger.warning("HH API вернул 403, пробуем RSS")
+                    return None  # сигнал, что API заблокирован
                 if resp.status != 200:
-                    logger.warning(f"HH API status {resp.status} for {keyword} in {city_id}")
+                    logger.warning(f"HH API status {resp.status} for {keyword}")
                     return []
                 data = await resp.json()
                 items = data.get("items", [])
-                logger.info(f"Найдено {len(items)} вакансий по запросу '{keyword}' в городе {city_id}")
+                logger.info(f"API: найдено {len(items)} вакансий по '{keyword}' в городе {city_id}")
                 result = []
                 for item in items:
                     result.append({
                         "id": item.get("id"),
+                        "url": item.get("alternate_url"),
                         "name": item.get("name"),
                         "employer": {"name": item.get("employer", {}).get("name")},
                         "area": {"name": item.get("area", {}).get("name")},
@@ -249,24 +306,39 @@ async def fetch_hh_vacancies(city_id, keyword, per_page=15):
                     })
                 return result
         except Exception as e:
-            logger.error(f"fetch_hh error: {e}")
+            logger.error(f"fetch_hh_api error: {e}")
             return []
 
-# --- Форматирование ---
+# --- Основная функция поиска ---
+async def fetch_hh_vacancies(city_id, keyword, per_page=15):
+    """Сначала пытается через API, при ошибке 403 использует RSS."""
+    api_result = await fetch_hh_api(city_id, keyword, per_page)
+    if api_result is None:  # 403
+        logger.info(f"Используем RSS для {keyword} в {city_id}")
+        return await fetch_hh_rss(city_id, keyword, per_page)
+    return api_result if api_result is not None else []
+
+# --- Форматирование с ссылкой ---
 def format_vacancy(v, score, idx, total):
     sal = v.get("salary")
     sal_str = f"{sal.get('from','')} - {sal.get('to','')} {sal.get('currency','')}".strip() if sal else "не указана"
+    url = v.get("url", "")
     msg = (f"📌 {idx}/{total}\n\n<b>{v.get('name','')}</b>\n🏢 {v.get('employer',{}).get('name','')}\n📍 {v.get('area',{}).get('name','')}\n💰 {sal_str}\n\n"
            f"📊 Скор: {score.total} ({score.verdict})\n• Роль: {score.role_fit}/10\n• Индустрия: {score.industry_match}/10\n"
            f"• Зарплата: {score.salary_match}/10\n• Локация: {score.location_match}/10\n• Опыт: {score.experience_match}/10\n"
            f"• Навыки: {score.skills_match}/10\n\n💬 {score.reasoning}")
     vid = v.get("id")
-    kb = InlineKeyboardMarkup([
+    # Клавиатура: добавили кнопку "Перейти"
+    kb_buttons = [
         [InlineKeyboardButton("👍", callback_data=f"like:{vid}"),
          InlineKeyboardButton("👎", callback_data=f"dislike:{vid}"),
          InlineKeyboardButton("📝", callback_data=f"apply:{vid}")],
-        [InlineKeyboardButton("➡️ Далее", callback_data="next")]
-    ])
+        [InlineKeyboardButton("🔗 Перейти", url=url) if url else None,
+         InlineKeyboardButton("➡️ Далее", callback_data="next")]
+    ]
+    # Убираем None
+    kb_buttons[1] = [btn for btn in kb_buttons[1] if btn is not None]
+    kb = InlineKeyboardMarkup(kb_buttons)
     return msg, kb
 
 # --- Команды ---
@@ -285,11 +357,19 @@ async def do_search(update, context, force=False):
     keywords = PROFILE["filters"]["keywords"]
 
     all_vacancies = []
+    api_blocked = False
     for city_name, city_id in cities:
         for kw in keywords:
             vacs = await fetch_hh_vacancies(city_id, kw, per_page=15)
+            if vacs is None:
+                api_blocked = True
+                continue
             all_vacancies.extend(vacs)
-            await asyncio.sleep(1)  # пауза 1 секунда, чтобы не перегружать API
+            await asyncio.sleep(2)  # пауза
+
+    if api_blocked and not all_vacancies:
+        await context.bot.send_message(chat_id, "⚠️ API HH.ru временно недоступен (403). Попробуйте позже или измените ключевые слова.")
+        return
 
     # Удаляем дубликаты и уже просмотренные
     seen_ids = set()
