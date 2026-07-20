@@ -1,13 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-Бот-поисковик вакансий с DeepSeek скорингом.
+Бот-поисковик вакансий с DeepSeek скорингом v2.0
 
-Источники:
-  1) HH.ru — OAuth client_credentials (dev.hh.ru)
-  2) «Работа в России» (trudvsem.ru) — без ключа
-  3) SuperJob — API-ключ (api.superjob.ru)
-  4) Пул бесплатных прокси (proxy_pool.py)
-  5) Демо-вакансии — fallback
+Исправления:
+- Увеличен лимит вакансий (10-20 за раз)
+- Все города и ключевые слова из профиля
+- Гибкий парсер команд и естественного языка
+- Умный фильтр: зарплата, город, удалёнка из текста
+- Дедупликация по названию+компании
+- Fallback: показывает лучшие, если порог не пройден
+- Пагинация: кнопка "Ещё вакансии"
 
 Переменные окружения:
   TELEGRAM_TOKEN      — токен бота (обязательно)
@@ -15,7 +17,7 @@
   HH_CLIENT_SECRET    — client_secret HH
   HH_USER_AGENT       — "App/1.0 (email@example.com)"
   SUPERJOB_KEY        — ключ SuperJob (опционально)
-  DEEPSEEK_API_KEY    — для скоринга вакансий (обязательно)
+  DEEPSEEK_API_KEY    — для скоринга (обязательно)
   RENDER_EXTERNAL_URL — для webhook (опционально)
 """
 
@@ -30,7 +32,6 @@ import random
 from datetime import datetime
 from typing import Optional, List, Dict, Any, Tuple
 from dataclasses import dataclass
-from contextlib import asynccontextmanager
 
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
@@ -77,7 +78,15 @@ SUPERJOB_KEY = os.getenv("SUPERJOB_KEY")
 
 PROXY_RETRIES = 6
 REQUEST_TIMEOUT = 15
-MAX_VACANCIES_PER_CYCLE = 3
+
+# === НОВОЕ: настройки выдачи ===
+VACANCIES_PER_PAGE = 10        # сколько показывать за раз
+MAX_VACANCIES_TOTAL = 50       # максимум собирать с API
+MIN_VACANCIES_TO_SHOW = 5      # минимум для показа (fallback на лучшие)
+HH_PER_PAGE = 20               # было 5 → теперь 20
+SJ_COUNT = 20                  # было 5 → теперь 20
+TV_PER_PAGE = 20               # было 10 → теперь 20
+
 DB_PATH = "vacancies.db"
 PROFILE_PATH = "profile.yaml"
 
@@ -176,6 +185,12 @@ def init_db():
             created_at TIMESTAMP
         )
     """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS seen_signatures (
+            signature TEXT PRIMARY KEY,
+            seen_at TIMESTAMP
+        )
+    """)
     conn.commit()
     conn.close()
 
@@ -190,6 +205,15 @@ def is_seen(vid: str) -> bool:
     finally:
         conn.close()
 
+def is_seen_signature(signature: str) -> bool:
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        c = conn.cursor()
+        c.execute("SELECT 1 FROM seen_signatures WHERE signature=?", (signature,))
+        return c.fetchone() is not None
+    finally:
+        conn.close()
+
 def mark_seen(vid: str, title: str, company: str, score: float):
     conn = sqlite3.connect(DB_PATH)
     try:
@@ -197,6 +221,11 @@ def mark_seen(vid: str, title: str, company: str, score: float):
         c.execute(
             "INSERT OR REPLACE INTO seen_vacancies VALUES (?,?,?,?,?)",
             (vid, title, company, score, datetime.now())
+        )
+        signature = f"{title.lower().strip()}|{company.lower().strip()}"
+        c.execute(
+            "INSERT OR IGNORE INTO seen_signatures VALUES (?,?)",
+            (signature, datetime.now())
         )
         conn.commit()
     finally:
@@ -232,6 +261,7 @@ def clear_seen():
     try:
         c = conn.cursor()
         c.execute("DELETE FROM seen_vacancies WHERE id LIKE 'demo_%'")
+        c.execute("DELETE FROM seen_signatures WHERE signature LIKE '%|demo%'")
         conn.commit()
     finally:
         conn.close()
@@ -359,7 +389,7 @@ async def fetch_json(url: str, *, params=None, headers=None, retry_statuses=(403
 #  ИСТОЧНИКИ ВАКАНСИЙ
 # =====================================================================
 
-async def fetch_hh_api(city_id: str, keyword: str, per_page: int = 5) -> List[Dict]:
+async def fetch_hh_api(city_id: str, keyword: str, per_page: int = 20) -> List[Dict]:
     url = "https://api.hh.ru/vacancies"
     params = {
         "area": city_id,
@@ -402,12 +432,13 @@ async def fetch_hh_api(city_id: str, keyword: str, per_page: int = 5) -> List[Di
             },
             "description": "",
             "source": "hh.ru",
+            "published_at": item.get("published_at", ""),
         }
         result.append(vacancy)
     return result
 
 
-async def fetch_superjob(city_name: str, keyword: str, count: int = 5) -> List[Dict]:
+async def fetch_superjob(city_name: str, keyword: str, count: int = 20) -> List[Dict]:
     if not SUPERJOB_KEY:
         return []
     url = "https://api.superjob.ru/2.0/vacancies/"
@@ -452,11 +483,12 @@ async def fetch_superjob(city_name: str, keyword: str, count: int = 5) -> List[D
             },
             "description": f"{it.get('candidat') or ''} {it.get('work') or ''}".strip(),
             "source": "superjob.ru",
+            "published_at": it.get("date_published", ""),
         })
     return result
 
 
-async def fetch_trudvsem(keyword: str, per_page: int = 10) -> List[Dict]:
+async def fetch_trudvsem(keyword: str, per_page: int = 20) -> List[Dict]:
     url = "https://opendata.trudvsem.ru/api/v1/vacancies"
     params = {"text": keyword, "offset": 0, "limit": per_page}
     headers = {"User-Agent": HH_USER_AGENT}
@@ -494,6 +526,7 @@ async def fetch_trudvsem(keyword: str, per_page: int = 10) -> List[Dict]:
                 v.get("duty"), v.get("requirements"), v.get("qualification")
             ])),
             "source": "trudvsem.ru",
+            "published_at": v.get("creation-date", ""),
         })
     return result
 
@@ -509,6 +542,7 @@ DEMO_VACANCIES = [
         "snippet": {"requirement": "Опыт управления отделом продаж ГСМ от 5 лет", "responsibility": "Руководство отделом"},
         "description": "Управление продажами нефтепродуктов, работа с НПЗ, логистика.",
         "source": "demo",
+        "published_at": datetime.now().isoformat(),
     },
     {
         "id": "demo_2",
@@ -520,6 +554,7 @@ DEMO_VACANCIES = [
         "snippet": {"requirement": "Опыт руководства отделом продаж от 3 лет, знание рынка нефтепродуктов", "responsibility": "Развитие клиентской базы"},
         "description": "Развитие направления оптовых продаж, контроль дебиторской задолженности.",
         "source": "demo",
+        "published_at": datetime.now().isoformat(),
     },
     {
         "id": "demo_3",
@@ -531,8 +566,137 @@ DEMO_VACANCIES = [
         "snippet": {"requirement": "Опыт работы в оптовых продажах, управление командой", "responsibility": "Построение отдела продаж"},
         "description": "Организация работы отдела продаж, поиск новых клиентов, работа с контрактами.",
         "source": "demo",
+        "published_at": datetime.now().isoformat(),
     },
 ]
+
+
+# =====================================================================
+#  УМНЫЙ ПАРСЕР ПОИСКОВОГО ЗАПРОСА
+# =====================================================================
+
+@dataclass
+class SearchQuery:
+    raw_text: str
+    keywords: List[str]
+    cities: List[str]
+    salary_min: Optional[int]
+    remote: bool
+    exclude: List[str]
+    
+    def build_hh_text(self) -> str:
+        parts = []
+        for kw in self.keywords:
+            parts.append(f'"{kw}"')
+        if not parts:
+            parts = [self.raw_text]
+        text = " AND ".join(parts)
+        for ex in self.exclude:
+            text += f' NOT "{ex}"'
+        return text
+    
+    def __str__(self):
+        parts = [f"🔍 Ключевые слова: {', '.join(self.keywords)}"]
+        if self.cities:
+            parts.append(f"📍 Города: {', '.join(self.cities)}")
+        if self.salary_min:
+            parts.append(f"💰 От {self.salary_min:,} ₽")
+        if self.remote:
+            parts.append("🏠 Удалённо")
+        if self.exclude:
+            parts.append(f"🚫 Исключить: {', '.join(self.exclude)}")
+        return "\n".join(parts)
+
+
+def parse_search_query(text: str) -> SearchQuery:
+    text_lower = text.lower().strip()
+    
+    if text_lower.startswith("/search"):
+        text_lower = text_lower[7:].strip()
+        text = text[7:].strip()
+    
+    query = SearchQuery(
+        raw_text=text,
+        keywords=[],
+        cities=[],
+        salary_min=None,
+        remote=False,
+        exclude=[],
+    )
+    
+    # Парсим зарплату
+    salary_patterns = [
+        r'(?:от\s+)?(\d{2,3})\s*к(?:\b|$)',
+        r'(?:от\s+)?(\d{3})\s*тыс(?:\w*)',
+        r'(?:от\s+)?(\d{5,6})(?:\s*руб|\s*₽)?',
+    ]
+    for pattern in salary_patterns:
+        match = re.search(pattern, text_lower)
+        if match:
+            sal = int(match.group(1))
+            if sal < 1000:
+                sal *= 1000
+            query.salary_min = sal
+            text_lower = re.sub(pattern, '', text_lower, count=1)
+            break
+    
+    # Парсим удалёнку
+    remote_words = ['удален', 'удалён', 'remote', 'удаленка', 'удалёнка', 'дистанц', 'на дому']
+    for rw in remote_words:
+        if rw in text_lower:
+            query.remote = True
+            text_lower = text_lower.replace(rw, '')
+            break
+    
+    # Парсим города
+    known_cities = list(PROFILE["filters"]["cities"].keys()) + [
+        "москва", "питер", "спб", "санкт-петербург", "волгоград", "казань",
+        "нижний новгород", "уфа", "екатеринбург", "новосибирск", "краснодар",
+        "ростов", "самара", "омск", "челябинск"
+    ]
+    for city in known_cities:
+        if city.lower() in text_lower:
+            query.cities.append(city)
+            text_lower = text_lower.replace(city.lower(), '')
+    
+    # Парсим исключения
+    exclude_patterns = [
+        r'(?:не|без|кроме|исключая)\s+(\w+)',
+        r'(?:без|кроме)\s+(\w+)',
+    ]
+    for pattern in exclude_patterns:
+        for match in re.finditer(pattern, text_lower):
+            query.exclude.append(match.group(1))
+            text_lower = text_lower.replace(match.group(0), '')
+    
+    # Парсим ключевые слова
+    stop_words = {
+        'ищу', 'найди', 'поиск', 'вакансии', 'работу', 'ищи', 'покажи', 'вакансия',
+        'нужна', 'хочу', 'работа', 'по', 'в', 'на', 'с', 'для', 'как', 'что', 'где',
+        'когда', 'кто', 'зарплат', 'зп', 'оклад', 'рублей', 'руб', '₽', 'тысяч',
+        'миллион', 'от', 'до', 'и', 'или',
+    }
+    
+    words = re.findall(r'\b[а-яa-zё]+\b', text_lower)
+    phrases = re.findall(r'\b[а-яa-zё]+(?:\s+[а-яa-zё]+){1,3}\b', text_lower)
+    
+    candidates = phrases + words
+    keywords = []
+    for cand in candidates:
+        cand = cand.strip()
+        if len(cand) < 3:
+            continue
+        if cand in stop_words:
+            continue
+        if cand in [k.lower() for k in keywords]:
+            continue
+        keywords.append(cand)
+    
+    if not keywords and text.strip():
+        keywords = [text.strip()]
+    
+    query.keywords = keywords[:5]
+    return query
 
 
 # =====================================================================
@@ -560,12 +724,12 @@ def calc_keyword_score(text: str, keywords: List[str]) -> float:
     return min(matches / max(len(keywords) * 0.3, 1), 1.0) * 10
 
 
-def calc_salary_score(salary: Optional[Dict]) -> float:
+def calc_salary_score(salary: Optional[Dict], min_sal: Optional[int] = None) -> float:
     if not salary:
         return 5.0
     from_ = salary.get("from")
     to_ = salary.get("to")
-    min_sal = PROFILE["candidate"]["salary_min"]
+    min_sal = min_sal or PROFILE["candidate"]["salary_min"]
     if from_ and from_ >= min_sal:
         return 10.0
     if to_ and to_ >= min_sal:
@@ -577,10 +741,11 @@ def calc_salary_score(salary: Optional[Dict]) -> float:
     return 2.0
 
 
-def calc_location_score(city: str) -> float:
+def calc_location_score(city: str, allowed_cities: Optional[List[str]] = None) -> float:
     city = (city or "").lower()
-    for allowed in PROFILE["filters"]["cities"]:
-        if allowed.lower() in city:
+    allowed = allowed_cities or list(PROFILE["filters"]["cities"].keys())
+    for allowed_city in allowed:
+        if allowed_city.lower() in city:
             return 10.0
     return 0.0
 
@@ -601,11 +766,7 @@ def calc_skills_score(text: str) -> float:
 #  DEEPSEEK СКОРИНГ
 # =====================================================================
 
-async def deepseek_score_vacancy(vacancy: Dict) -> Optional[float]:
-    """
-    Отправляет вакансию в DeepSeek и получает оценку релевантности 0-100.
-    Возвращает None если DeepSeek недоступен или ошибка.
-    """
+async def deepseek_score_vacancy(vacancy: Dict, query: Optional[SearchQuery] = None) -> Optional[float]:
     if not deepseek_available:
         return None
     
@@ -632,6 +793,16 @@ async def deepseek_score_vacancy(vacancy: Dict) -> Optional[float]:
     snippet_req = snippet_req[:400] if snippet_req else ""
     snippet_resp = snippet_resp[:400] if snippet_resp else ""
     
+    user_query_str = ""
+    if query and query.keywords:
+        user_query_str = f"\nЗАПРОС ПОЛЬЗОВАТЕЛЯ: {' '.join(query.keywords)}"
+        if query.cities:
+            user_query_str += f"\nГорода пользователя: {', '.join(query.cities)}"
+        if query.salary_min:
+            user_query_str += f"\nМин. зарплата пользователя: {query.salary_min:,} ₽"
+        if query.remote:
+            user_query_str += "\nПользователь ищет удалённую работу"
+    
     prompt = f"""Оцени релевантность вакансии для кандидата. Ответь ТОЛЬКО числом от 0 до 100, без объяснений.
 
 ПРОФИЛЬ КАНДИДАТА:
@@ -640,6 +811,7 @@ async def deepseek_score_vacancy(vacancy: Dict) -> Optional[float]:
 - Ключевые навыки: управление продажами, B2B, работа с НПЗ, нефтетрейдинг, логистика ГСМ
 - Минимальная зарплата: 150000 рублей
 - Города: Волгоград, Москва, Казань, Нижний Новгород, Уфа, Санкт-Петербург
+{user_query_str}
 
 ВАКАНСИЯ:
 - Название: {name}
@@ -658,7 +830,7 @@ async def deepseek_score_vacancy(vacancy: Dict) -> Optional[float]:
 20-39 = Слабо: далёкая отрасль или низкая зарплата
 0-19 = Не подходит: стажёр, junior, розница, IT, совсем другая сфера
 
-ВАЖНО: Если в названии есть "коммерческий директор", "директор по продажам" или "руководитель отдела продаж" — это плюс. Если компания явно из нефтегаза (НПЗ, ГСМ, АЗС, нефтетрейдинг) — это большой плюс. Если город не из списка — минус.
+ВАЖНО: Если в названии есть "коммерческий директор", "директор по продажам" или "руководитель отдела продаж" — это плюс. Если компания явно из нефтегаза (НПЗ, ГСМ, АЗС, нефтетрейдинг) — это большой плюс. Если город не из списка — минус. Если запрос пользователя указан — учитывай его приоритетно.
 
 Оценка (только число 0-100):"""
 
@@ -689,11 +861,7 @@ async def deepseek_score_vacancy(vacancy: Dict) -> Optional[float]:
     return None
 
 
-async def score_vacancy(vacancy: Dict) -> VacancyScore:
-    """
-    Скоринг вакансии. Сначала быстрый keyword-анализ, потом DeepSeek.
-    DeepScore имеет приоритет 80%, keyword — 20%.
-    """
+async def score_vacancy(vacancy: Dict, query: Optional[SearchQuery] = None) -> VacancyScore:
     text = " ".join(filter(None, [
         vacancy.get("name", ""),
         vacancy.get("description", ""),
@@ -703,10 +871,14 @@ async def score_vacancy(vacancy: Dict) -> VacancyScore:
     
     w = PROFILE["scoring"]["weights"]
     
-    role = calc_keyword_score(text, PROFILE["filters"]["keywords"])
+    search_keywords = query.keywords if query else PROFILE["filters"]["keywords"]
+    search_cities = query.cities if query else list(PROFILE["filters"]["cities"].keys())
+    min_salary = query.salary_min if query else None
+    
+    role = calc_keyword_score(text, search_keywords)
     industry = calc_keyword_score(text, PROFILE["filters"]["industry_keywords"])
-    salary = calc_salary_score(vacancy.get("salary"))
-    location = calc_location_score((vacancy.get("area") or {}).get("name", ""))
+    salary = calc_salary_score(vacancy.get("salary"), min_salary)
+    location = calc_location_score((vacancy.get("area") or {}).get("name", ""), search_cities)
     experience = calc_experience_score(text)
     skills = calc_skills_score(text)
     
@@ -733,7 +905,22 @@ async def score_vacancy(vacancy: Dict) -> VacancyScore:
                 reasoning=f"Исключено: найдено слово '{word}'"
             )
     
-    deep_score = await deepseek_score_vacancy(vacancy)
+    if query and query.exclude:
+        for word in query.exclude:
+            if word.lower() in text:
+                return VacancyScore(
+                    total=0.0,
+                    role_fit=round(role, 1),
+                    industry_match=round(industry, 1),
+                    salary_match=round(salary, 1),
+                    location_match=round(location, 1),
+                    experience_match=round(experience, 1),
+                    skills_match=round(skills, 1),
+                    verdict="SKIP",
+                    reasoning=f"Исключено по запросу: '{word}'"
+                )
+    
+    deep_score = await deepseek_score_vacancy(vacancy, query)
     
     if deep_score is not None:
         final_score = deep_score * 0.8 + keyword_total * 0.2
@@ -815,8 +1002,15 @@ def format_vacancy(v: Dict, score: VacancyScore, idx: int, total: int) -> Tuple[
     src = v.get("source", "")
     src_tag = f" ({src})" if src and src != "demo" else ""
     
+    verdict_emoji = {
+        "STRONG_MATCH": "🟢",
+        "MATCH": "🟡",
+        "WEAK_MATCH": "🟠",
+        "SKIP": "🔴",
+    }.get(score.verdict, "⚪")
+    
     msg = (
-        f"📌 <b>{idx}/{total}</b>{src_tag}\n\n"
+        f"{verdict_emoji} <b>{idx}/{total}</b>{src_tag}\n\n"
         f"<b>{v.get('name', '')}</b>\n"
         f"🏢 {v.get('employer', {}).get('name', 'Не указано')}\n"
         f"📍 {v.get('area', {}).get('name', 'Не указано')}\n"
@@ -841,7 +1035,11 @@ def format_vacancy(v: Dict, score: VacancyScore, idx: int, total: int) -> Tuple[
     ]
     if url:
         kb_buttons[1].append(InlineKeyboardButton("🔗 Открыть", url=url))
-    kb_buttons[1].append(InlineKeyboardButton("➡️ Далее", callback_data="next"))
+    
+    if idx < total:
+        kb_buttons[1].append(InlineKeyboardButton("➡️ Далее", callback_data="next"))
+    else:
+        kb_buttons[1].append(InlineKeyboardButton("🔄 Ещё вакансии", callback_data="more"))
     
     return msg, InlineKeyboardMarkup(kb_buttons)
 
@@ -856,10 +1054,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Ищу позиции коммерческого директора и руководителей отдела продаж "
         "в нефтегазовой отрасли.\n\n"
         "<b>Команды:</b>\n"
-        "/search — найти вакансии\n"
+        "/search — найти вакансии по профилю\n"
+        "/search [запрос] — гибкий поиск (примеры ниже)\n"
         "/stats — статистика\n"
+        "/clear — очистить историю\n"
         "/help — помощь\n\n"
-        "Просто напишите мне, и я постараюсь помочь!",
+        "<b>Примеры запросов:</b>\n"
+        "• <code>/search коммерческий директор москва</code>\n"
+        "• <code>/search руководитель продаж удаленно от 100к</code>\n"
+        "• <code>/search директор по продажам не стажер</code>\n"
+        "• Просто напиши: <i>\"ищу работу в нефтегазе\"</i>",
         parse_mode="HTML"
     )
 
@@ -869,11 +1073,22 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if search_in_progress:
         await update.message.reply_text("⏳ Поиск уже выполняется, подождите...")
         return
-    await update.message.reply_text("🔍 Начинаю поиск вакансий, это займёт около минуты...")
-    await do_search(update, context)
+    
+    args = context.args
+    if args:
+        query_text = " ".join(args)
+        query = parse_search_query(query_text)
+        await update.message.reply_text(
+            f"🔍 Ищу по твоему запросу:\n{query}\n\nЭто займёт около минуты..."
+        )
+    else:
+        query = None
+        await update.message.reply_text("🔍 Начинаю поиск вакансий по профилю, это займёт около минуты...")
+    
+    await do_search(update, context, query=query)
 
 
-async def do_search(update: Update, context: ContextTypes.DEFAULT_TYPE, force: bool = False):
+async def do_search(update: Update, context: ContextTypes.DEFAULT_TYPE, query: Optional[SearchQuery] = None, force: bool = False):
     global search_in_progress
     if search_in_progress:
         return
@@ -881,36 +1096,66 @@ async def do_search(update: Update, context: ContextTypes.DEFAULT_TYPE, force: b
     chat_id = update.effective_chat.id
     
     try:
-        cities = list(PROFILE["filters"]["cities"].items())[:3]
-        keywords = PROFILE["filters"]["keywords"][:3]
-
+        if query and query.cities:
+            city_map = PROFILE["filters"]["cities"]
+            cities = []
+            for city_name in query.cities:
+                city_lower = city_name.lower()
+                for prof_city, prof_id in city_map.items():
+                    if prof_city.lower() in city_lower or city_lower in prof_city.lower():
+                        cities.append((prof_city, prof_id))
+                        break
+                else:
+                    cities.append((city_name, "1"))
+            if not cities:
+                cities = list(city_map.items())
+        else:
+            cities = list(PROFILE["filters"]["cities"].items())
+        
+        if query and query.keywords:
+            keywords = query.keywords
+        else:
+            keywords = PROFILE["filters"]["keywords"]
+        
         all_vacancies: List[Dict] = []
+        total_combinations = 0
         
         for city_name, city_id in cities:
-            for kw in keywords:
+            for kw in keywords[:3]:
+                total_combinations += 1
+                if total_combinations > 15:
+                    break
+                
+                if query:
+                    hh_text = query.build_hh_text()
+                else:
+                    hh_text = kw
+                
                 try:
-                    vacs = await fetch_hh_api(city_id, kw, per_page=5)
+                    vacs = await fetch_hh_api(city_id, hh_text, per_page=HH_PER_PAGE)
                     all_vacancies.extend(vacs)
                 except Exception as e:
                     logger.error(f"HH error for {city_name}/{kw}: {e}")
-                await asyncio.sleep(random.uniform(1.5, 3))
+                await asyncio.sleep(random.uniform(1.0, 2.0))
                 
                 if SUPERJOB_KEY:
                     try:
-                        sj = await fetch_superjob(city_name, kw, count=5)
+                        sj = await fetch_superjob(city_name, kw, count=SJ_COUNT)
                         all_vacancies.extend(sj)
                     except Exception as e:
                         logger.error(f"SJ error for {city_name}/{kw}: {e}")
-                    await asyncio.sleep(random.uniform(1, 2))
+                    await asyncio.sleep(random.uniform(0.5, 1.5))
                 
                 try:
-                    tv = await fetch_trudvsem(kw, per_page=10)
+                    tv = await fetch_trudvsem(kw, per_page=TV_PER_PAGE)
                     all_vacancies.extend(tv)
                 except Exception as e:
                     logger.error(f"TV error for {kw}: {e}")
-                await asyncio.sleep(random.uniform(1, 2))
+                await asyncio.sleep(random.uniform(0.5, 1.5))
             
-            await asyncio.sleep(2)
+            if total_combinations > 15:
+                break
+            await asyncio.sleep(1)
 
         if not all_vacancies:
             logger.info("Реальных вакансий не найдено, показываем демо")
@@ -930,15 +1175,30 @@ async def do_search(update: Update, context: ContextTypes.DEFAULT_TYPE, force: b
             all_vacancies = demo_list
 
         seen_ids = set()
+        seen_sigs = set()
         unique = []
         for v in all_vacancies:
             vid = v["id"]
             if vid in seen_ids:
                 continue
             seen_ids.add(vid)
+            
+            sig = f"{v.get('name','').lower().strip()}|{v.get('employer',{}).get('name','').lower().strip()}"
+            if sig in seen_sigs:
+                continue
+            seen_sigs.add(sig)
+            
             if not force and is_seen(vid):
                 continue
+            if not force and is_seen_signature(sig):
+                continue
+            
             unique.append(v)
+            
+            if len(unique) >= MAX_VACANCIES_TOTAL:
+                break
+
+        logger.info(f"После дедупликации: {len(unique)} уникальных вакансий")
 
         if not unique:
             await context.bot.send_message(
@@ -947,29 +1207,35 @@ async def do_search(update: Update, context: ContextTypes.DEFAULT_TYPE, force: b
                 "Все доступные вакансии уже просмотрены.\n"
                 "Попробуйте:\n"
                 "• Подождать появления новых вакансий\n"
-                "• Изменить критерии в profile.yaml",
+                "• Изменить критерии в profile.yaml\n"
+                "• Использовать /clear для сброса истории",
                 parse_mode="HTML"
             )
             return
 
-        # --- ASYNC СКОРИНГ С DEEPSEEK ---
         scored = []
         for v in unique:
-            score = await score_vacancy(v)
+            score = await score_vacancy(v, query)
             scored.append((v, score))
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(0.2)
         
         scored.sort(key=lambda x: x[1].total, reverse=True)
         
-        # --- ТОЛЬКО ПРОШЕДШИЕ ПОРОГ ---
         good = [(v, s) for v, s in scored if s.verdict in ("MATCH", "STRONG_MATCH")]
         
-        if not good:
-            good = [(v, s) for v, s in scored if s.verdict == "WEAK_MATCH"]
+        if len(good) < MIN_VACANCIES_TO_SHOW:
+            weak = [(v, s) for v, s in scored if s.verdict == "WEAK_MATCH"]
+            good.extend(weak)
         
-        if good:
-            good = good[:MAX_VACANCIES_PER_CYCLE]
-        else:
+        if len(good) < MIN_VACANCIES_TO_SHOW:
+            remaining = [(v, s) for v, s in scored if s.verdict not in ("MATCH", "STRONG_MATCH", "WEAK_MATCH") and s.verdict != "SKIP"]
+            remaining.sort(key=lambda x: x[1].total, reverse=True)
+            good.extend(remaining[:MIN_VACANCIES_TO_SHOW - len(good)])
+        
+        good.sort(key=lambda x: x[1].total, reverse=True)
+        good = good[:VACANCIES_PER_PAGE]
+        
+        if not good:
             await context.bot.send_message(
                 chat_id,
                 "📭 <b>Нет вакансий, соответствующих твоему профилю.</b>\n\n"
@@ -986,6 +1252,7 @@ async def do_search(update: Update, context: ContextTypes.DEFAULT_TYPE, force: b
 
         context.chat_data["vacancies"] = good
         context.chat_data["index"] = 0
+        context.chat_data["search_query"] = query
         
         if good:
             await show_vacancy(update, context, 0)
@@ -1002,7 +1269,7 @@ async def do_search(update: Update, context: ContextTypes.DEFAULT_TYPE, force: b
 async def show_vacancy(update: Update, context: ContextTypes.DEFAULT_TYPE, idx: int):
     vacancies = context.chat_data.get("vacancies", [])
     if not vacancies or idx >= len(vacancies):
-        text = "✅ Все вакансии просмотрены."
+        text = "✅ Все вакансии просмотрены.\n\nНажми /search для нового поиска."
         try:
             if update.callback_query:
                 await update.callback_query.edit_message_text(text)
@@ -1035,6 +1302,12 @@ async def show_vacancy(update: Update, context: ContextTypes.DEFAULT_TYPE, idx: 
     context.chat_data["index"] = idx
 
 
+async def more_vacancies(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = context.chat_data.get("search_query")
+    await update.callback_query.answer("Загружаю ещё...")
+    await do_search(update, context, query=query, force=True)
+
+
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -1043,6 +1316,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "next":
         idx = context.chat_data.get("index", 0) + 1
         await show_vacancy(update, context, idx)
+        return
+    
+    if data == "more":
+        await more_vacancies(update, context)
         return
     
     if ":" not in data:
@@ -1094,6 +1371,20 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mark_seen(vid, v.get("name"), v.get("employer", {}).get("name"), s.total)
 
 
+async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        c = conn.cursor()
+        c.execute("DELETE FROM seen_vacancies")
+        c.execute("DELETE FROM seen_signatures")
+        conn.commit()
+        await update.message.reply_text("🗑️ История просмотров очищена. Можно искать заново!")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка: {e}")
+    finally:
+        conn.close()
+
+
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     seen, apps = get_stats()
     hh_status = "✅ есть" if hh_auth.token else "❌ нет"
@@ -1103,7 +1394,8 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• Откликов: <b>{apps}</b>\n"
         f"• Прокси в пуле: <b>{proxy_pool.size}</b>\n"
         f"• HH токен: {hh_status}\n"
-        f"• DeepSeek: {'✅' if deepseek_available else '❌'}",
+        f"• DeepSeek: {'✅' if deepseek_available else '❌'}\n"
+        f"• Выдача за раз: <b>{VACANCIES_PER_PAGE}</b>",
         parse_mode="HTML"
     )
 
@@ -1111,11 +1403,18 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📖 <b>Справка</b>\n\n"
-        "<b>/search</b> — найти вакансии по профилю\n"
-        "<b>/stats</b> — статистика просмотров и откликов\n"
+        "<b>/search</b> — найти вакансии по профилю (10 штук)\n"
+        "<b>/search [запрос]</b> — гибкий поиск. Примеры:\n"
+        "  • <code>/search коммерческий директор москва</code>\n"
+        "  • <code>/search руководитель продаж удаленно от 100к</code>\n"
+        "  • <code>/search директор по продажам не стажер</code>\n\n"
+        "<b>/stats</b> — статистика\n"
+        "<b>/clear</b> — очистить историю просмотров\n"
         "<b>/help</b> — эта справка\n\n"
-        "Можно писать свободно: \"найди работу\", \"покажи вакансии\", \"статистика\".\n\n"
-        "Для изменения критериев поиска отредактируйте <code>profile.yaml</code>.",
+        "Также можно писать свободно:\n"
+        "• <i>\"ищу работу в нефтегазе\"</i>\n"
+        "• <i>\"покажи вакансии коммерческого директора\"</i>\n"
+        "• <i>\"статистика\"</i>",
         parse_mode="HTML"
     )
 
@@ -1159,14 +1458,27 @@ async def deepseek_chat(message: str) -> str:
 
 def parse_natural(text: str) -> Optional[str]:
     text = text.lower().strip()
-    if any(w in text for w in ["привет", "здравствуй", "ку", "хай", "hello"]):
-        return "help"
-    if any(w in text for w in ["найди", "поиск", "вакансии", "работу", "ищи", "покажи", "вакансия"]):
+    
+    search_triggers = [
+        "найди", "поиск", "вакансии", "работу", "ищи", "покажи", "вакансия",
+        "ищу", "нужна работа", "хочу работать", "подбери", "посоветуй",
+        "вакансии по", "работа в", "вакансия на",
+    ]
+    if any(t in text for t in search_triggers):
         return "search"
-    if any(w in text for w in ["статистика", "стат", "сколько", "цифры"]):
+    
+    stat_triggers = ["статистика", "стат", "сколько", "цифры", "просмотрено", "откликов"]
+    if any(t in text for t in stat_triggers):
         return "stats"
-    if any(w in text for w in ["помощь", "help", "команды", "что умеешь"]):
+    
+    help_triggers = ["помощь", "help", "команды", "что умеешь", "привет", "здравствуй", "ку", "хай"]
+    if any(t in text for t in help_triggers):
         return "help"
+    
+    clear_triggers = ["очисти", "сбрось", "clear", "удали историю", "забудь"]
+    if any(t in text for t in clear_triggers):
+        return "clear"
+    
     return None
 
 
@@ -1175,13 +1487,20 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     action = parse_natural(text)
     
     if action == "search":
-        await search_command(update, context)
+        query = parse_search_query(text)
+        await update.message.reply_text(
+            f"🔍 Ищу по твоему запросу:\n{query}\n\nЭто займёт около минуты..."
+        )
+        await do_search(update, context, query=query)
         return
     elif action == "stats":
         await stats_command(update, context)
         return
     elif action == "help":
         await help_command(update, context)
+        return
+    elif action == "clear":
+        await clear_command(update, context)
         return
 
     await update.message.reply_text("🤔 Думаю...")
@@ -1254,6 +1573,7 @@ async def run():
     telegram_app.add_handler(CommandHandler("search", search_command))
     telegram_app.add_handler(CommandHandler("stats", stats_command))
     telegram_app.add_handler(CommandHandler("help", help_command))
+    telegram_app.add_handler(CommandHandler("clear", clear_command))
     telegram_app.add_handler(CallbackQueryHandler(callback_handler))
     telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
