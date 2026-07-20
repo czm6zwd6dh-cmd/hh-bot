@@ -57,3 +57,4 @@ scoring:
     location_match: 0.10
     experience_match: 0.10
     skills_match: 0.10
+ 
