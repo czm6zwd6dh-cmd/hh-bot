@@ -1286,4 +1286,3 @@ if __name__ == "__main__":
         asyncio.run(run())
     except KeyboardInterrupt:
         logger.info("Прервано пользователем")
- 
