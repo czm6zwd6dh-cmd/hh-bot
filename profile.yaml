@@ -1,0 +1,42 @@
+candidate:
+  name: Виктор Зинченко
+  desired_positions:
+    - коммерческий директор
+    - руководитель отдела продаж
+    - директор по продажам
+  key_skills:
+    - управление продажами
+    - нефтепродукты
+    - B2B
+    - логистика
+  salary_min: 150000
+filters:
+  cities:
+    Волгоград: "24"
+    Москва: "1"
+    Казань: "88"
+    Нижний Новгород: "66"
+    Уфа: "99"
+    Санкт-Петербург: "2"
+  keywords:
+    - коммерческий директор
+    - директор по продажам
+    - руководитель отдела продаж
+  industry_keywords:
+    - нефтепродукты
+    - ГСМ
+    - топливо
+    - нефть
+  exclude_words:
+    - стажёр
+    - junior
+    - стажер
+scoring:
+  min_score: 35
+  weights:
+    role_fit: 0.30
+    industry_match: 0.25
+    salary_match: 0.15
+    location_match: 0.10
+    experience_match: 0.10
+    skills_match: 0.10
